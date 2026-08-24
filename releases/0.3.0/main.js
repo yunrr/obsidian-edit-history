@@ -4503,6 +4503,20 @@ var DEFAULT_SETTINGS = {
   debugLevel: "warn"
 };
 var EDIT_HISTORY_FILE_EXT = ".edtz";
+var DEVICE_HISTORY_FILE_MARKER = ".eh-";
+var DEVICE_STORAGE_KEY = "edit-history-device";
+var DEFAULT_DEVICE_NAME = "This device";
+function createDeviceId() {
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 var EditHistory = class extends import_obsidian.Plugin {
   /**
    * @return true if an edit history file should be kept for this file
@@ -4539,8 +4553,119 @@ var EditHistory = class extends import_obsidian.Plugin {
     const activeFile = this.app.workspace.getActiveFile();
     return activeFile != null && this.keepEditHistoryForFile(activeFile);
   }
-  getEditHistoryFilepath(filepath) {
+  getLegacyEditHistoryFilepath(filepath) {
     return (0, import_obsidian.normalizePath)(this.editHistoryRootFolder + "/" + filepath + EDIT_HISTORY_FILE_EXT);
+  }
+  getEditHistoryFilepath(filepath) {
+    return (0, import_obsidian.normalizePath)(this.editHistoryRootFolder + "/" + filepath + DEVICE_HISTORY_FILE_MARKER + this.deviceId + EDIT_HISTORY_FILE_EXT);
+  }
+  getFallbackDeviceStorageKey() {
+    return DEVICE_STORAGE_KEY + ":" + this.app.vault.getName();
+  }
+  loadDeviceIdentityFromStorage() {
+    let stored = null;
+    try {
+      if (typeof this.app.loadLocalStorage === "function") {
+        stored = this.app.loadLocalStorage(DEVICE_STORAGE_KEY);
+      } else if (typeof window !== "undefined" && window.localStorage) {
+        const value = window.localStorage.getItem(this.getFallbackDeviceStorageKey());
+        stored = value == null ? null : JSON.parse(value);
+      }
+    } catch (error) {
+      logWarn("Unable to load local device identity", error);
+    }
+    if (stored == null || typeof stored.id !== "string" || stored.id.length == 0) {
+      return null;
+    }
+    return {
+      id: stored.id,
+      name: typeof stored.name === "string" && stored.name.trim().length > 0 ? stored.name.trim() : DEFAULT_DEVICE_NAME
+    };
+  }
+  saveDeviceIdentityToStorage(identity) {
+    try {
+      if (typeof this.app.saveLocalStorage === "function") {
+        this.app.saveLocalStorage(DEVICE_STORAGE_KEY, identity);
+      } else if (typeof window !== "undefined" && window.localStorage) {
+        window.localStorage.setItem(this.getFallbackDeviceStorageKey(), JSON.stringify(identity));
+      }
+    } catch (error) {
+      logWarn("Unable to save local device identity", error);
+    }
+  }
+  loadDeviceIdentity() {
+    var _a, _b;
+    const stored = this.loadDeviceIdentityFromStorage();
+    this.deviceId = (_a = stored == null ? void 0 : stored.id) != null ? _a : createDeviceId();
+    this.deviceName = (_b = stored == null ? void 0 : stored.name) != null ? _b : DEFAULT_DEVICE_NAME;
+    this.saveDeviceIdentityToStorage({ id: this.deviceId, name: this.deviceName });
+  }
+  setDeviceName(name) {
+    const trimmedName = name.trim();
+    if (trimmedName.length == 0) {
+      return;
+    }
+    this.deviceName = trimmedName;
+    this.saveDeviceIdentityToStorage({ id: this.deviceId, name: this.deviceName });
+  }
+  async copyLegacyEditHistoryFile(filepath, legacyFile) {
+    const newFilepath = this.getEditHistoryFilepath(filepath);
+    try {
+      const data = await this.app.vault.readBinary(legacyFile);
+      const dirpath = newFilepath.substring(0, newFilepath.lastIndexOf("/") + 1);
+      await this.app.vault.createFolder(dirpath).catch(() => null);
+      const copiedFile = await this.app.vault.createBinary(newFilepath, data);
+      if (copiedFile == null) {
+        logError("Can't migrate edit history file", legacyFile.path, "to", newFilepath);
+        return null;
+      }
+      logInfo("Migrated edit history file", legacyFile.path, "to", newFilepath);
+      return copiedFile;
+    } catch (error) {
+      logError("Can't migrate edit history file", legacyFile.path, "to", newFilepath, error);
+      return null;
+    }
+  }
+  async getEditHistoryFileForRead(filepath) {
+    const deviceFile = this.app.vault.getAbstractFileByPath(this.getEditHistoryFilepath(filepath));
+    if (deviceFile instanceof import_obsidian.TFile) {
+      return deviceFile;
+    }
+    if (deviceFile != null) {
+      logError("Edit history file is not a file", deviceFile.path);
+      return null;
+    }
+    const legacyFile = this.app.vault.getAbstractFileByPath(this.getLegacyEditHistoryFilepath(filepath));
+    if (legacyFile instanceof import_obsidian.TFile) {
+      return await this.copyLegacyEditHistoryFile(filepath, legacyFile);
+    }
+    if (legacyFile != null) {
+      logError("Legacy edit history file is not a file", legacyFile.path);
+    }
+    return null;
+  }
+  async renameEditHistoryFile(oldPath, newPath, pathBuilder) {
+    const oldHistoryFilepath = pathBuilder(oldPath);
+    const oldHistoryFile = this.app.vault.getAbstractFileByPath(oldHistoryFilepath);
+    if (oldHistoryFile == null) {
+      return;
+    }
+    if (!(oldHistoryFile instanceof import_obsidian.TFile)) {
+      logError("Edit history path is not a file", oldHistoryFilepath);
+      return;
+    }
+    const newHistoryFilepath = pathBuilder(newPath);
+    const newHistoryFile = this.app.vault.getAbstractFileByPath(newHistoryFilepath);
+    if (newHistoryFile != null) {
+      logWarn("Not renaming edit history because destination exists", newHistoryFilepath);
+      return;
+    }
+    try {
+      logInfo("Renaming edit history file", oldHistoryFilepath, "to", newHistoryFilepath);
+      await this.app.vault.rename(oldHistoryFile, newHistoryFilepath);
+    } catch (error) {
+      logError("Can't rename edit history file", oldHistoryFilepath, "to", newHistoryFilepath, error);
+    }
   }
   getEditCompressedSize(zip, filepath) {
     return zip.file(filepath)._data.compressedSize;
@@ -4605,6 +4730,7 @@ var EditHistory = class extends import_obsidian.Plugin {
   }
   async onload() {
     await this.loadSettings();
+    this.loadDeviceIdentity();
     let dmpobj = new import_diff_match_patch_ts.DiffMatchPatch();
     logInfo("onLoad");
     this.registerEvent(this.app.vault.on("modify", async (fileOrFolder, force = false) => {
@@ -4620,11 +4746,25 @@ var EditHistory = class extends import_obsidian.Plugin {
       let file = fileOrFolder;
       let zipFilepath = this.getEditHistoryFilepath(file.path);
       let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
+      let migrated = false;
+      if (zipFile == null) {
+        const legacyFile = this.app.vault.getAbstractFileByPath(this.getLegacyEditHistoryFilepath(file.path));
+        if (legacyFile instanceof import_obsidian.TFile) {
+          zipFile = await this.copyLegacyEditHistoryFile(file.path, legacyFile);
+          migrated = zipFile != null;
+          if (zipFile == null) {
+            return;
+          }
+        } else if (legacyFile != null) {
+          logError("Legacy edit history file is not a file", legacyFile.path);
+          return;
+        }
+      }
       if (zipFile != null && !(zipFile instanceof import_obsidian.TFile)) {
         logError("Edit history file is not a file", zipFilepath);
         return;
       }
-      if (!force && zipFile != null && file.stat.mtime - zipFile.stat.mtime < this.minMsBetweenEdits) {
+      if (!force && !migrated && zipFile != null && file.stat.mtime - zipFile.stat.mtime < this.minMsBetweenEdits) {
         logDbg(
           "Need to pass",
           (this.minMsBetweenEdits - (file.stat.mtime - zipFile.stat.mtime)) / 1e3,
@@ -4749,7 +4889,7 @@ var EditHistory = class extends import_obsidian.Plugin {
       }
       this.statusBarItemEl.setText(numEdits + 1 + " edits");
     }));
-    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+    this.registerEvent(this.app.vault.on("rename", async (file, oldPath) => {
       logInfo("vault rename path", file.path);
       if (file instanceof import_obsidian.TFolder && file.path == this.editHistoryRootFolder) {
         logInfo(
@@ -4775,26 +4915,26 @@ var EditHistory = class extends import_obsidian.Plugin {
         logDbg("Not moving edit history, expected to be moved later alongside parent folder");
         return;
       }
-      let zipFilepath = this.getEditHistoryFilepath(oldPath);
-      let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-      if (zipFile != null) {
-        let newZipFilepath = this.getEditHistoryFilepath(file.path);
-        logInfo("Renaming edit history file", zipFilepath, "to", newZipFilepath);
-        this.app.vault.rename(zipFile, newZipFilepath);
-      }
+      await this.renameEditHistoryFile(oldPath, file.path, (filepath) => this.getEditHistoryFilepath(filepath));
+      await this.renameEditHistoryFile(oldPath, file.path, (filepath) => this.getLegacyEditHistoryFilepath(filepath));
     }));
-    this.registerEvent(this.app.vault.on("delete", (file) => {
+    this.registerEvent(this.app.vault.on("delete", async (file) => {
       var _a;
       logInfo("vault delete path", file.path);
       if (!this.keepEditHistoryForFile(file)) {
         logDbg("Ignoring non whitelisted file", file.path);
         return;
       }
-      let zipFilepath = this.getEditHistoryFilepath(file.path);
-      let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-      if (zipFile != null) {
-        logInfo("Deleting edit history file", zipFilepath);
-        this.app.vault.trash(zipFile, ((_a = this.settings.deleteToWhere) != null ? _a : "system") === "system");
+      const historyFilepaths = /* @__PURE__ */ new Set([
+        this.getEditHistoryFilepath(file.path),
+        this.getLegacyEditHistoryFilepath(file.path)
+      ]);
+      for (const historyFilepath of historyFilepaths) {
+        const historyFile = this.app.vault.getAbstractFileByPath(historyFilepath);
+        if (historyFile != null) {
+          logInfo("Deleting edit history file", historyFilepath);
+          await this.app.vault.trash(historyFile, ((_a = this.settings.deleteToWhere) != null ? _a : "system") === "system");
+        }
       }
     }));
     const ribbonIconEl = this.addRibbonIcon("clock", "Open edit history", (evt) => {
@@ -5129,7 +5269,7 @@ var EditHistoryModal = class extends import_obsidian.Modal {
     const file = this.app.workspace.getActiveFile();
     this.titleEl.setText("Edits for ");
     this.titleEl.createEl("i", { text: file == null ? void 0 : file.name });
-    this.titleEl.createEl("span", { text: " " });
+    this.titleEl.createEl("span", { text: " (" + this.plugin.deviceName + ") " });
     const calendarIcon = this.titleEl.createEl("span");
     (0, import_obsidian.setIcon)(calendarIcon, "calendar-plus-2");
     this.modalEl.addClass("edit-history-modal");
@@ -5144,7 +5284,7 @@ var EditHistoryModal = class extends import_obsidian.Modal {
     const zip = new import_jszip.default();
     const zipFilepath = this.plugin.getEditHistoryFilepath(file.path);
     logInfo("Opening zip file ", zipFilepath);
-    const zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
+    const zipFile = await this.plugin.getEditHistoryFileForRead(file.path);
     if (zipFile == null || !(zipFile instanceof import_obsidian.TFile)) {
       logWarn("No history file or not a file", zipFilepath);
       contentEl.createEl("p", { text: "No edit history file" });
@@ -5363,6 +5503,14 @@ var EditHistorySettingTab = class extends import_obsidian.PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("small", { text: "Created by " }).appendChild(createEl("a", { text: "Antonio Tejada", href: "https://github.com/antoniotejada/" }));
     containerEl.createEl("h3", { text: "General" });
+    new import_obsidian.Setting(containerEl).setName("Device name").setDesc("A local label for this device. It does not affect history file names or sync.").addText((text) => text.setValue(this.plugin.deviceName).onChange((value) => {
+      if (value.trim().length == 0) {
+        text.setValue(this.plugin.deviceName);
+        return;
+      }
+      logInfo("Device name: " + value);
+      this.plugin.setDeviceName(value);
+    }));
     new import_obsidian.Setting(containerEl).setName("Minimum seconds between edits").setDesc("Minimum number of seconds that must pass from the previous edit to store a new edit, set to 0 to disable. Modifications done between those seconds will be merged into the next edit, reducing the edit history file size at the expense of less history granularity.").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.minSecondsBetweenEdits).setValue(this.plugin.settings.minSecondsBetweenEdits).onChange(async (value) => {
       logInfo("Minimum seconds between edits: " + value);
       this.plugin.settings.minSecondsBetweenEdits = value;

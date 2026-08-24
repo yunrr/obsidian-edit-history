@@ -142,6 +142,27 @@ const DEFAULT_SETTINGS: EditHistorySettings = {
 }
 
 const EDIT_HISTORY_FILE_EXT = ".edtz";
+const DEVICE_HISTORY_FILE_MARKER = ".eh-";
+const DEVICE_STORAGE_KEY = "edit-history-device";
+const DEFAULT_DEVICE_NAME = "This device";
+
+interface EditHistoryDeviceIdentity {
+    id: string;
+    name: string;
+}
+
+function createDeviceId(): string {
+    const bytes = new Uint8Array(16);
+    if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+        crypto.getRandomValues(bytes);
+    } else {
+        for (let i = 0; i < bytes.length; i++) {
+            bytes[i] = Math.floor(Math.random() * 256);
+        }
+    }
+
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+}
 
 // XXX Use Github actions to release plugin 
 //     See https://docs.obsidian.md/Plugins/Releasing/Release+your+plugin+with+GitHub+Actions
@@ -167,6 +188,8 @@ const EDIT_HISTORY_FILE_EXT = ".edtz";
 export default class EditHistory extends Plugin {
     settings: EditHistorySettings;
     statusBarItemEl: HTMLElement;
+    deviceId: string;
+    deviceName: string;
 
     // Minimum number of milliseconds between edits or Infinity, if a
     // modification occurs before that time will be ignored at this moment and
@@ -241,9 +264,136 @@ export default class EditHistory extends Plugin {
 
         return ((activeFile != null) && (this.keepEditHistoryForFile(activeFile)));
     }
+
+    getLegacyEditHistoryFilepath(filepath: string): string {
+        return normalizePath(this.editHistoryRootFolder + "/" + filepath + EDIT_HISTORY_FILE_EXT);
+    }
     
     getEditHistoryFilepath(filepath: string): string {
-        return normalizePath(this.editHistoryRootFolder + "/" + filepath + EDIT_HISTORY_FILE_EXT);
+        return normalizePath(this.editHistoryRootFolder + "/" + filepath + DEVICE_HISTORY_FILE_MARKER + this.deviceId + EDIT_HISTORY_FILE_EXT);
+    }
+
+    getFallbackDeviceStorageKey(): string {
+        return DEVICE_STORAGE_KEY + ":" + this.app.vault.getName();
+    }
+
+    loadDeviceIdentityFromStorage(): EditHistoryDeviceIdentity | null {
+        let stored: any = null;
+        try {
+            if (typeof this.app.loadLocalStorage === "function") {
+                stored = this.app.loadLocalStorage(DEVICE_STORAGE_KEY);
+            } else if (typeof window !== "undefined" && window.localStorage) {
+                const value = window.localStorage.getItem(this.getFallbackDeviceStorageKey());
+                stored = (value == null) ? null : JSON.parse(value);
+            }
+        } catch (error) {
+            logWarn("Unable to load local device identity", error);
+        }
+
+        if ((stored == null) || (typeof stored.id !== "string") || (stored.id.length == 0)) {
+            return null;
+        }
+
+        return {
+            id: stored.id,
+            name: (typeof stored.name === "string" && stored.name.trim().length > 0)
+                ? stored.name.trim()
+                : DEFAULT_DEVICE_NAME,
+        };
+    }
+
+    saveDeviceIdentityToStorage(identity: EditHistoryDeviceIdentity): void {
+        try {
+            if (typeof this.app.saveLocalStorage === "function") {
+                this.app.saveLocalStorage(DEVICE_STORAGE_KEY, identity);
+            } else if (typeof window !== "undefined" && window.localStorage) {
+                window.localStorage.setItem(this.getFallbackDeviceStorageKey(), JSON.stringify(identity));
+            }
+        } catch (error) {
+            logWarn("Unable to save local device identity", error);
+        }
+    }
+
+    loadDeviceIdentity(): void {
+        const stored = this.loadDeviceIdentityFromStorage();
+        this.deviceId = stored?.id ?? createDeviceId();
+        this.deviceName = stored?.name ?? DEFAULT_DEVICE_NAME;
+        this.saveDeviceIdentityToStorage({ id: this.deviceId, name: this.deviceName });
+    }
+
+    setDeviceName(name: string): void {
+        const trimmedName = name.trim();
+        if (trimmedName.length == 0) {
+            return;
+        }
+
+        this.deviceName = trimmedName;
+        this.saveDeviceIdentityToStorage({ id: this.deviceId, name: this.deviceName });
+    }
+
+    async copyLegacyEditHistoryFile(filepath: string, legacyFile: TFile): Promise<TFile | null> {
+        const newFilepath = this.getEditHistoryFilepath(filepath);
+        try {
+            const data = await this.app.vault.readBinary(legacyFile);
+            const dirpath = newFilepath.substring(0, newFilepath.lastIndexOf("/") + 1);
+            await this.app.vault.createFolder(dirpath).catch(() => null);
+            const copiedFile = await this.app.vault.createBinary(newFilepath, data);
+            if (copiedFile == null) {
+                logError("Can't migrate edit history file", legacyFile.path, "to", newFilepath);
+                return null;
+            }
+            logInfo("Migrated edit history file", legacyFile.path, "to", newFilepath);
+            return copiedFile;
+        } catch (error) {
+            logError("Can't migrate edit history file", legacyFile.path, "to", newFilepath, error);
+            return null;
+        }
+    }
+
+    async getEditHistoryFileForRead(filepath: string): Promise<TFile | null> {
+        const deviceFile = this.app.vault.getAbstractFileByPath(this.getEditHistoryFilepath(filepath));
+        if (deviceFile instanceof TFile) {
+            return deviceFile;
+        }
+        if (deviceFile != null) {
+            logError("Edit history file is not a file", deviceFile.path);
+            return null;
+        }
+
+        const legacyFile = this.app.vault.getAbstractFileByPath(this.getLegacyEditHistoryFilepath(filepath));
+        if (legacyFile instanceof TFile) {
+            return await this.copyLegacyEditHistoryFile(filepath, legacyFile);
+        }
+        if (legacyFile != null) {
+            logError("Legacy edit history file is not a file", legacyFile.path);
+        }
+        return null;
+    }
+
+    async renameEditHistoryFile(oldPath: string, newPath: string, pathBuilder: (filepath: string) => string): Promise<void> {
+        const oldHistoryFilepath = pathBuilder(oldPath);
+        const oldHistoryFile = this.app.vault.getAbstractFileByPath(oldHistoryFilepath);
+        if (oldHistoryFile == null) {
+            return;
+        }
+        if (!(oldHistoryFile instanceof TFile)) {
+            logError("Edit history path is not a file", oldHistoryFilepath);
+            return;
+        }
+
+        const newHistoryFilepath = pathBuilder(newPath);
+        const newHistoryFile = this.app.vault.getAbstractFileByPath(newHistoryFilepath);
+        if (newHistoryFile != null) {
+            logWarn("Not renaming edit history because destination exists", newHistoryFilepath);
+            return;
+        }
+
+        try {
+            logInfo("Renaming edit history file", oldHistoryFilepath, "to", newHistoryFilepath);
+            await this.app.vault.rename(oldHistoryFile, newHistoryFilepath);
+        } catch (error) {
+            logError("Can't rename edit history file", oldHistoryFilepath, "to", newHistoryFilepath, error);
+        }
     }
 
     getEditCompressedSize(zip: JSZip, filepath: string): number {
@@ -342,6 +492,7 @@ export default class EditHistory extends Plugin {
     async onload() {
         // Load settings as early as possible console output is seen if enabled
         await this.loadSettings();
+        this.loadDeviceIdentity();
 
         // XXX Make this a member variable?
         let dmpobj = new DiffMatchPatch();
@@ -368,6 +519,20 @@ export default class EditHistory extends Plugin {
             let file = fileOrFolder as TFile;
             let zipFilepath = this.getEditHistoryFilepath(file.path);
             let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
+            let migrated = false;
+            if (zipFile == null) {
+                const legacyFile = this.app.vault.getAbstractFileByPath(this.getLegacyEditHistoryFilepath(file.path));
+                if (legacyFile instanceof TFile) {
+                    zipFile = await this.copyLegacyEditHistoryFile(file.path, legacyFile);
+                    migrated = (zipFile != null);
+                    if (zipFile == null) {
+                        return;
+                    }
+                } else if (legacyFile != null) {
+                    logError("Legacy edit history file is not a file", legacyFile.path);
+                    return;
+                }
+            }
             if ((zipFile != null) && !(zipFile instanceof TFile)) {
                 // Not a file, error
                 logError("Edit history file is not a file", zipFilepath);
@@ -438,7 +603,7 @@ export default class EditHistory extends Plugin {
             //        unrelated edits when the app is closed before the timer
             //        expires. The timer needs to be per file/editor?
             //     See https://github.com/antoniotejada/obsidian-edit-history/issues/9
-            if (!force && 
+            if (!force && !migrated &&
                 (zipFile != null) && ((file.stat.mtime - zipFile.stat.mtime) < this.minMsBetweenEdits)) {
                 logDbg("Need to pass", 
                     (this.minMsBetweenEdits - (file.stat.mtime - zipFile.stat.mtime)) / 1000, "s between edits, ignoring");
@@ -679,7 +844,7 @@ export default class EditHistory extends Plugin {
             this.statusBarItemEl.setText((numEdits + 1) + " edits");
         }));
         
-        this.registerEvent(this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
+        this.registerEvent(this.app.vault.on("rename", async (file: TAbstractFile, oldPath: string) => {
             logInfo("vault rename path", file.path);
             // This reports any files or folders modified via the api, ignore
             // non whitelisted files/folders
@@ -725,17 +890,12 @@ export default class EditHistory extends Plugin {
                 return;
             }
 
-            // Rename the edit history file if any
-            let zipFilepath = this.getEditHistoryFilepath(oldPath);
-            let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-            if (zipFile != null) {
-                let newZipFilepath = this.getEditHistoryFilepath(file.path);
-                logInfo("Renaming edit history file", zipFilepath,"to", newZipFilepath);
-                this.app.vault.rename(zipFile, newZipFilepath);
-            }
+            // Rename both the current device history and any legacy shared history.
+            await this.renameEditHistoryFile(oldPath, file.path, (filepath) => this.getEditHistoryFilepath(filepath));
+            await this.renameEditHistoryFile(oldPath, file.path, (filepath) => this.getLegacyEditHistoryFilepath(filepath));
         }));
 
-        this.registerEvent(this.app.vault.on("delete", (file: TAbstractFile) => {
+        this.registerEvent(this.app.vault.on("delete", async (file: TAbstractFile) => {
             logInfo("vault delete path", file.path);
             // This reports any files or folders modified via the api, ignore
             // non whitelisted files/folders
@@ -743,12 +903,17 @@ export default class EditHistory extends Plugin {
                 logDbg("Ignoring non whitelisted file", file.path);
                 return;
             }
-            // Delete the edit history file if any
-            let zipFilepath = this.getEditHistoryFilepath(file.path);
-            let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
-            if (zipFile != null) {
-                logInfo("Deleting edit history file", zipFilepath);
-                this.app.vault.trash(zipFile, (this.settings.deleteToWhere ?? "system") === "system");
+            // Delete current device and legacy shared history files if present.
+            const historyFilepaths = new Set([
+                this.getEditHistoryFilepath(file.path),
+                this.getLegacyEditHistoryFilepath(file.path),
+            ]);
+            for (const historyFilepath of historyFilepaths) {
+                const historyFile = this.app.vault.getAbstractFileByPath(historyFilepath);
+                if (historyFile != null) {
+                    logInfo("Deleting edit history file", historyFilepath);
+                    await this.app.vault.trash(historyFile, (this.settings.deleteToWhere ?? "system") === "system");
+                }
             }
         }));
 
@@ -1297,7 +1462,7 @@ class EditHistoryModal extends Modal {
 
         this.titleEl.setText("Edits for ");
         this.titleEl.createEl("i", { text: file?.name });
-        this.titleEl.createEl("span", { text: " " });
+        this.titleEl.createEl("span", { text: " (" + this.plugin.deviceName + ") " });
 
         const calendarIcon = this.titleEl.createEl("span")
         // XXX This icon is not visible on mobile on some older versions,
@@ -1327,7 +1492,7 @@ class EditHistoryModal extends Modal {
         const zip: JSZip = new JSZip();
         const zipFilepath = this.plugin.getEditHistoryFilepath(file.path);
         logInfo("Opening zip file ", zipFilepath);
-        const zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
+        const zipFile = await this.plugin.getEditHistoryFileForRead(file.path);
         if ((zipFile == null) || (!(zipFile instanceof TFile))) {
             logWarn("No history file or not a file", zipFilepath);
             contentEl.createEl("p", { text: "No edit history file"});
@@ -1714,6 +1879,20 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
         // h2 is abnormally small in settings, start with h3 which has the right
         // size (other plugins do the same)
         containerEl.createEl("h3", {text: "General"});
+
+        new Setting(containerEl)
+            .setName("Device name")
+            .setDesc("A local label for this device. It does not affect history file names or sync.")
+            .addText(text => text
+                .setValue(this.plugin.deviceName)
+                .onChange((value) => {
+                    if (value.trim().length == 0) {
+                        text.setValue(this.plugin.deviceName);
+                        return;
+                    }
+                    logInfo("Device name: " + value);
+                    this.plugin.setDeviceName(value);
+                }));
 
         new Setting(containerEl)
             .setName("Minimum seconds between edits")

@@ -27,6 +27,8 @@ This is similar to the [File Recovery](https://help.obsidian.md/Plugins/File+rec
 - The edit history file is automatically managed when modifications are done to the note under Obsidian
   - renamed when the note is renamed (including folder changes).
   - deleted when the note is deleted
+- Edit history files are kept separately per device, so vault file synchronization does not merge device histories
+- Device-specific history storage works on desktop and mobile; the device label is stored locally per vault
 - Edit history files can be safely deleted outside of Obsidian in order to free storage.
 - Keep edit history files for all files or just for the extensions specified in the settings
 - Don't keep edit history files for those filepaths containing the substrings specified in the settings
@@ -46,7 +48,9 @@ This is similar to the [File Recovery](https://help.obsidian.md/Plugins/File+rec
 
 ## The edit history file
 
-The plugin creates one edit history (.edtz) file per note, in the same folder as the note. 
+The plugin creates one device-specific edit history (.edtz) file per note, in the same folder as the note. For example, a note named `Notes/a.md` has a history file like `Notes/a.md.eh-<device-id>.edtz`.
+
+The device name is a local label stored separately on each device. Renaming the label does not rename or move history files. Existing shared history files named `Notes/a.md.edtz` are copied to the current device history the first time the note history is opened or updated. The old shared file is retained until it is no longer needed by other devices.
 
 ### Format
 
