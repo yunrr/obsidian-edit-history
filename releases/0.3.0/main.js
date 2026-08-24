@@ -4494,6 +4494,7 @@ var DEFAULT_SETTINGS = {
   maxEdits: "0",
   maxHistoryFileSizeKB: "0",
   editHistoryRootFolder: "",
+  deleteToWhere: "system",
   extensionWhitelist: ".md, .txt, .csv, .htm, .html",
   substringBlacklist: "",
   showOnStatusBar: true,
@@ -4783,6 +4784,7 @@ var EditHistory = class extends import_obsidian.Plugin {
       }
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
+      var _a;
       logInfo("vault delete path", file.path);
       if (!this.keepEditHistoryForFile(file)) {
         logDbg("Ignoring non whitelisted file", file.path);
@@ -4792,7 +4794,7 @@ var EditHistory = class extends import_obsidian.Plugin {
       let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
       if (zipFile != null) {
         logInfo("Deleting edit history file", zipFilepath);
-        this.app.vault.delete(zipFile);
+        this.app.vault.trash(zipFile, ((_a = this.settings.deleteToWhere) != null ? _a : "system") === "system");
       }
     }));
     const ribbonIconEl = this.addRibbonIcon("clock", "Open edit history", (evt) => {
@@ -5391,6 +5393,14 @@ var EditHistorySettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.substringBlacklist = value;
       await this.plugin.saveSettings();
     }));
+    new import_obsidian.Setting(containerEl).setName("Delete history files to").setDesc("Choose whether deleted edit history files go to the system trash or the Obsidian .trash folder.").addDropdown((dropdown) => {
+      var _a;
+      return dropdown.addOption("system", "System trash (default)").addOption("obsidian", "Obsidian .trash folder").setValue((_a = this.plugin.settings.deleteToWhere) != null ? _a : DEFAULT_SETTINGS.deleteToWhere).onChange(async (value) => {
+        logInfo("Delete history files to: " + value);
+        this.plugin.settings.deleteToWhere = value;
+        await this.plugin.saveSettings();
+      });
+    });
     containerEl.createEl("h3", { text: "Appearance" });
     new import_obsidian.Setting(containerEl).setName("Show on status bar").setDesc("Show edit history file information on the status bar. Click the status bar to show the edit history for the current file.").addToggle((toggle) => toggle.setValue(this.plugin.settings.showOnStatusBar).onChange(async (value) => {
       logInfo("Show edits on status bar: " + value);

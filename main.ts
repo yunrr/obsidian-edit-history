@@ -116,6 +116,7 @@ interface EditHistorySettings {
     maxEditAge: string;
     maxHistoryFileSizeKB: string;
     editHistoryRootFolder: string;
+    deleteToWhere: "system" | "obsidian";
     extensionWhitelist: string;
     substringBlacklist: string;
     showOnStatusBar: boolean;
@@ -131,6 +132,7 @@ const DEFAULT_SETTINGS: EditHistorySettings = {
     maxEdits: "0",
     maxHistoryFileSizeKB: "0",
     editHistoryRootFolder: "",
+    deleteToWhere: "system",
     extensionWhitelist: ".md, .txt, .csv, .htm, .html",
     substringBlacklist: "",
     showOnStatusBar: true,
@@ -746,10 +748,7 @@ export default class EditHistory extends Plugin {
             let zipFile = this.app.vault.getAbstractFileByPath(zipFilepath);
             if (zipFile != null) {
                 logInfo("Deleting edit history file", zipFilepath);
-                // XXX Should this trash instead of delete? (the Obsidian
-                //     setting under Files and Links allows choosing between
-                //     system trash, obsidian trash and delete)
-                this.app.vault.delete(zipFile);
+                this.app.vault.trash(zipFile, (this.settings.deleteToWhere ?? "system") === "system");
             }
         }));
 
@@ -1787,6 +1786,19 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
                         this.plugin.settings.substringBlacklist = value;
                         await this.plugin.saveSettings();
                     }));
+
+        new Setting(containerEl)
+            .setName("Delete history files to")
+            .setDesc("Choose whether deleted edit history files go to the system trash or the Obsidian .trash folder.")
+            .addDropdown(dropdown => dropdown
+                .addOption("system", "System trash (default)")
+                .addOption("obsidian", "Obsidian .trash folder")
+                .setValue(this.plugin.settings.deleteToWhere ?? DEFAULT_SETTINGS.deleteToWhere)
+                .onChange(async (value) => {
+                    logInfo("Delete history files to: " + value);
+                    this.plugin.settings.deleteToWhere = value as "system" | "obsidian";
+                    await this.plugin.saveSettings();
+                }));
 
         containerEl.createEl("h3", {text: "Appearance"});
         new Setting(containerEl)
