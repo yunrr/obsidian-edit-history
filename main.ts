@@ -2467,6 +2467,11 @@ class EditHistoryMergeModal extends Modal {
 class EditHistorySettingTab extends PluginSettingTab { plugin:
     EditHistory;
 
+    // History profiles shown expanded, kept while the settings tab is open so
+    // a re-render (adding, removing or activating a profile) does not lose the
+    // collapse state the user gave to the other profiles
+    expandedProfileIds: Set<string> = new Set();
+
     constructor(app: App, plugin: EditHistory) {
         super(app, plugin);
         this.plugin = plugin;
@@ -2483,50 +2488,94 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
         containerEl.createEl("small", { text: "Created by "})
             .appendChild(createEl("a", { text: "Antonio Tejada", href:"https://github.com/antoniotejada/"}));
 
-        // h2 is abnormally small in settings, start with h3 which has the right
-        // size (other plugins do the same)
-        containerEl.createEl("h3", {text: "History profiles"});
-
-        containerEl.createEl("div", { text:
-            "A history profile selects the suffix of the edit history file name, a note Notes/a.md is stored as " +
-            `Notes/a.md${HISTORY_SUFFIX_MARKER}<suffix>${EDIT_HISTORY_FILE_EXT}. ` +
-            "Use the same suffix on every device that should keep a single edit history for this vault. " +
-            "Profiles are stored in the local plugin settings, they are not synchronized with the vault." });
-
+        // The profiles section title bar is a Setting row (styled as a section
+        // title by .edit-history-profiles-header in styles.css) so the profile
+        // selector and the button to add a profile sit on the title row
         const historyProfiles = this.plugin.getHistoryProfiles();
+        const activeProfile = this.plugin.getActiveHistoryProfile();
+
+        // Only the active profile is expanded by default, the profiles the user
+        // expanded by hand stay expanded while the tab is open. Note the state
+        // is deliberately not stored in the settings
+        for (const profileId of [...this.expandedProfileIds]) {
+            if (!historyProfiles.some(profile => profile.id == profileId)) {
+                this.expandedProfileIds.delete(profileId);
+            }
+        }
+
         let activeProfileDropdown: DropdownComponent | null = null;
         new Setting(containerEl)
-            .setName("Active profile")
-            .setDesc("Profile used to read and write edit history files")
+            .setClass("edit-history-profiles-header")
+            .setName("History profiles")
+            .setDesc("The selector on this row chooses the history profile used to read and write edit history files, " +
+                "Add profile creates a new one. A history profile selects the suffix of the edit history file name, " +
+                "a note Notes/a.md is stored as " +
+                `Notes/a.md${HISTORY_SUFFIX_MARKER}<suffix>${EDIT_HISTORY_FILE_EXT}. ` +
+                "Use the same suffix on every device that should keep a single edit history for this vault. " +
+                "Profiles are stored in the local plugin settings, they are not synchronized with the vault.")
             .addDropdown(dropdown => {
                 activeProfileDropdown = dropdown;
                 for (const profile of historyProfiles) {
                     dropdown.addOption(profile.id, this.plugin.getHistoryProfileLabel(profile));
                 }
-                dropdown.setValue(this.plugin.getActiveHistoryProfile()?.id ?? "");
+                dropdown.setValue(activeProfile?.id ?? "");
+                dropdown.selectEl.setAttribute("aria-label", "Profile used to read and write edit history files");
                 dropdown.onChange(async (value) => {
                     logInfo("Active history profile: " + value);
                     await this.plugin.setActiveHistoryProfile(value);
                     this.display();
                 });
-            });
+            })
+            .addButton(button => button
+                .setButtonText("Add profile")
+                .onClick(async () => {
+                    logInfo("Adding a history profile");
+                    await this.plugin.addHistoryProfile();
+                    this.display();
+                }));
 
         for (const profile of historyProfiles) {
+            // Each profile is a collapsible panel, collapsed to its title bar
+            // when it is not in use, so the page stays short when there are
+            // several profiles
+            const profileEl = containerEl.createEl("details", { cls: "edit-history-profile" });
+            const isActiveProfile = (profile.id == activeProfile?.id);
+            profileEl.open = isActiveProfile || this.expandedProfileIds.has(profile.id);
+
+            const summaryEl = profileEl.createEl("summary", { cls: "edit-history-profile-summary" });
+            const labelEl = summaryEl.createEl("span", {
+                cls: "edit-history-profile-label",
+                text: this.plugin.getHistoryProfileLabel(profile) });
+            if (isActiveProfile) {
+                summaryEl.createEl("span", { cls: "edit-history-profile-active", text: "in use" });
+            }
+            profileEl.addEventListener("toggle", () => {
+                // The active profile is expanded by the render, only remember
+                // the panels the user opened by hand
+                if (profileEl.open && !isActiveProfile) {
+                    this.expandedProfileIds.add(profile.id);
+                } else {
+                    this.expandedProfileIds.delete(profile.id);
+                }
+            });
+
             // Update the labels in place on every change, a full re-render
             // would lose the focus of the text field being edited
             const refreshLabels = () => {
-                setting.setName(this.plugin.getHistoryProfileLabel(profile));
+                const label = this.plugin.getHistoryProfileLabel(profile);
+                labelEl.setText(label);
+                setting.setName(label);
                 const options = activeProfileDropdown?.selectEl.options;
                 if (options) {
                     for (let i = 0; i < options.length; i++) {
                         if (options[i].value == profile.id) {
-                            options[i].text = this.plugin.getHistoryProfileLabel(profile);
+                            options[i].text = label;
                         }
                     }
                 }
             };
 
-            const setting = new Setting(containerEl)
+            const setting = new Setting(profileEl)
                 .setName(this.plugin.getHistoryProfileLabel(profile))
                 .setDesc("Name is a local label shown in the edit history dialog, suffix is part of the history file name")
                 .addText(text => text
@@ -2564,16 +2613,6 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
                 setting.controlEl.lastElementChild?.setAttribute("aria-label", "Delete this profile, its edit history files are kept");
             }
         }
-
-        new Setting(containerEl)
-            .setName("Add profile")
-            .setDesc("Add a history profile and make it the active profile")
-            .addButton(button => button
-                .setButtonText("Add")
-                .onClick(async () => {
-                    await this.plugin.addHistoryProfile();
-                    this.display();
-                }));
 
         new Setting(containerEl)
             .setName("Merge old edit history files")

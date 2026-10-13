@@ -131,3 +131,53 @@
     white-space: nowrap;
     font-family: 'Courier New', Courier, monospace;
 }
+
+/*
+ * History profiles settings
+ */
+
+/* Title bar of the history profiles section, it holds the profile selector and
+   the button to add a profile */
+.edit-history-profiles-header {
+    border-top: none;
+    padding-top: 0;
+}
+.edit-history-profiles-header .setting-item-name {
+    /* Match the h3 of the other settings sections, since h2 is abnormally
+       small in settings */
+    font-size: var(--h3-size, 1.17em);
+    font-weight: var(--h3-weight, 600);
+    line-height: var(--h3-line-height, 1.3);
+    color: var(--text-normal);
+}
+
+/* Every history profile is a collapsible panel */
+.edit-history-profile {
+    border: 1px solid var(--background-modifier-border);
+    border-radius: var(--radius-m, 6px);
+    padding: 0 var(--size-4-3, 12px);
+    margin-bottom: var(--size-4-2, 8px);
+}
+.edit-history-profile > summary.edit-history-profile-summary {
+    cursor: pointer;
+    padding: var(--size-4-2, 8px) 0;
+    font-weight: var(--font-medium, 500);
+    color: var(--text-normal);
+}
+.edit-history-profile > summary.edit-history-profile-summary:hover {
+    color: var(--text-accent);
+}
+/* Mark of the profile used to read and write the edit history files */
+.edit-history-profile .edit-history-profile-active {
+    margin-left: var(--size-4-2, 8px);
+    padding: 0 var(--size-4-2, 8px);
+    border-radius: var(--radius-s, 4px);
+    background-color: var(--background-modifier-hover);
+    color: var(--text-muted);
+    font-size: var(--font-ui-smaller, 0.8em);
+    font-weight: var(--font-normal, 400);
+}
+/* The setting rows are inside the panel, so the first one needs no separator */
+.edit-history-profile > .setting-item:first-of-type {
+    border-top: none;
+}

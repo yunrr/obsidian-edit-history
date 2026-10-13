@@ -4443,7 +4443,169 @@ __export(main_exports, {
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
 var import_diff_match_patch_ts = __toESM(require_diff_match_patch_ts_bundle());
+var import_jszip2 = __toESM(require_jszip_min());
+
+// history-merge.ts
 var import_jszip = __toESM(require_jszip_min());
+var EDIT_HISTORY_FILE_EXT = ".edtz";
+var HISTORY_SUFFIX_MARKER = ".eh-";
+var MAX_HISTORY_SUFFIX_LENGTH = 64;
+var INVALID_SUFFIX_CHARS = /[\\/:*?"<>|#^[\]]/;
+var HISTORY_ENTRY_NAME = /^[0-9a-z]+\$?$/;
+function containsControlChar(value) {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 32 || code == 127) {
+      return true;
+    }
+  }
+  return false;
+}
+function historyEntryEpoch(entryName) {
+  return parseInt(entryName, 36) * 1e3;
+}
+function historyEntryIsDiff(entryName) {
+  return !entryName.endsWith("$");
+}
+function buildHistoryEntryName(mtime, isDiff) {
+  const utcepoch = Math.floor(mtime / 1e3);
+  return utcepoch.toString(36) + (isDiff ? "" : "$");
+}
+function sortHistoryEntriesDescending(entryNames) {
+  entryNames.sort((a, b) => historyEntryEpoch(b) - historyEntryEpoch(a));
+}
+function normalizeHistorySuffix(suffix) {
+  if (typeof suffix !== "string") {
+    return null;
+  }
+  const trimmed = suffix.trim();
+  if (trimmed.length == 0 || trimmed.length > MAX_HISTORY_SUFFIX_LENGTH) {
+    return null;
+  }
+  if (INVALID_SUFFIX_CHARS.test(trimmed) || trimmed.includes("..") || containsControlChar(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+function deriveHistoryNotePathCandidates(historyPath, rootFolder) {
+  if (!historyPath.endsWith(EDIT_HISTORY_FILE_EXT)) {
+    return [];
+  }
+  let path = historyPath;
+  const root = (rootFolder != null ? rootFolder : "").replace(/^\/+|\/+$/g, "");
+  if (root.length > 0) {
+    if (!path.startsWith(root + "/")) {
+      return [];
+    }
+    path = path.substring(root.length + 1);
+  }
+  const withoutExt = path.substring(0, path.length - EDIT_HISTORY_FILE_EXT.length);
+  const candidates = [];
+  const markerIndex = withoutExt.lastIndexOf(HISTORY_SUFFIX_MARKER);
+  if (markerIndex > 0) {
+    const suffix = withoutExt.substring(markerIndex + HISTORY_SUFFIX_MARKER.length);
+    if (suffix.length > 0) {
+      candidates.push({ notePath: withoutExt.substring(0, markerIndex), suffix });
+    }
+  }
+  candidates.push({ notePath: withoutExt, suffix: null });
+  return candidates;
+}
+async function readHistoryVersions(zip, patchEngine) {
+  const entryNames = [];
+  zip.forEach((relativePath) => {
+    entryNames.push(relativePath);
+  });
+  if (entryNames.length == 0) {
+    return { versions: [], error: "history file has no entries" };
+  }
+  for (const entryName of entryNames) {
+    if (!HISTORY_ENTRY_NAME.test(entryName)) {
+      return { versions: [], error: "entry " + entryName + " is not a history entry name" };
+    }
+  }
+  sortHistoryEntriesDescending(entryNames);
+  const versions = [];
+  let content = null;
+  for (const entryName of entryNames) {
+    const entry = zip.file(entryName);
+    if (entry == null) {
+      continue;
+    }
+    const entryData = await entry.async("string");
+    let versionContent;
+    if (historyEntryIsDiff(entryName)) {
+      if (content == null) {
+        return { versions: [], error: "newest entry " + entryName + " is a diff, cannot rebuild the chain" };
+      }
+      versionContent = patchEngine.patch_apply(patchEngine.patch_fromText(entryData), content)[0];
+    } else {
+      versionContent = entryData;
+    }
+    content = versionContent;
+    versions.push({ epoch: historyEntryEpoch(entryName), content: versionContent });
+  }
+  return { versions, error: null };
+}
+function mergeHistoryVersionLists(versionLists) {
+  const byEpoch = /* @__PURE__ */ new Map();
+  let duplicateEpochs = 0;
+  for (const versionList of versionLists) {
+    for (const version of versionList) {
+      if (byEpoch.has(version.epoch)) {
+        duplicateEpochs++;
+        continue;
+      }
+      byEpoch.set(version.epoch, version);
+    }
+  }
+  const versions = Array.from(byEpoch.values());
+  versions.sort((a, b) => a.epoch - b.epoch);
+  return { versions, duplicateEpochs };
+}
+async function buildMergedHistoryZip(versions, patchEngine) {
+  const zip = new import_jszip.default();
+  let fullEntryCount = 0;
+  let skippedDuplicateContent = 0;
+  let newerContent = null;
+  const orderedVersions = [];
+  const seenEpochs = /* @__PURE__ */ new Set();
+  for (const version of [...versions].sort((a, b) => a.epoch - b.epoch)) {
+    if (seenEpochs.has(version.epoch)) {
+      continue;
+    }
+    seenEpochs.add(version.epoch);
+    orderedVersions.push(version);
+  }
+  for (let i = orderedVersions.length - 1; i >= 0; --i) {
+    const version = orderedVersions[i];
+    if (newerContent != null && newerContent == version.content) {
+      skippedDuplicateContent++;
+      continue;
+    }
+    const date = new Date(version.epoch - new Date(version.epoch).getTimezoneOffset() * 6e4);
+    if (newerContent == null) {
+      zip.file(buildHistoryEntryName(version.epoch, false), version.content, { date, compression: "DEFLATE" });
+      fullEntryCount++;
+    } else {
+      const patch = patchEngine.patch_toText(patchEngine.patch_make(newerContent, version.content));
+      if (patch.length < version.content.length) {
+        zip.file(buildHistoryEntryName(version.epoch, true), patch, { date, compression: "DEFLATE" });
+      } else {
+        zip.file(buildHistoryEntryName(version.epoch, false), version.content, { date, compression: "DEFLATE" });
+        fullEntryCount++;
+      }
+    }
+    newerContent = version.content;
+  }
+  return {
+    zip,
+    fullEntryCount,
+    skippedDuplicateContent
+  };
+}
+
+// main.ts
 var debugLevels = ["debug", "info", "warn", "error"];
 var logError = function(message, ...optionalParams) {
 };
@@ -4465,7 +4627,7 @@ function hookLogFunctions(debugLevelIndex, tag) {
 var htmlChars = {
   "&": "&amp;",
   '"': "&quot;",
-  "'/": "&#39;",
+  "'": "&#39;",
   "<": "&lt;",
   ">": "&gt;",
   "\n": "<br>\n"
@@ -4500,12 +4662,14 @@ var DEFAULT_SETTINGS = {
   showOnStatusBar: true,
   diffDisplayFormat: "INLINE" /* Inline */,
   showWhitespace: true,
-  debugLevel: "warn"
+  debugLevel: "warn",
+  // Empty so the first profile is created from the local device identity
+  historyProfiles: [],
+  activeHistoryProfileId: ""
 };
-var EDIT_HISTORY_FILE_EXT = ".edtz";
-var DEVICE_HISTORY_FILE_MARKER = ".eh-";
 var DEVICE_STORAGE_KEY = "edit-history-device";
 var DEFAULT_DEVICE_NAME = "This device";
+var DEFAULT_HISTORY_PROFILE_NAME = "New profile";
 function createDeviceId() {
   const bytes = new Uint8Array(16);
   if (typeof crypto !== "undefined" && crypto.getRandomValues) {
@@ -4556,8 +4720,185 @@ var EditHistory = class extends import_obsidian.Plugin {
   getLegacyEditHistoryFilepath(filepath) {
     return (0, import_obsidian.normalizePath)(this.editHistoryRootFolder + "/" + filepath + EDIT_HISTORY_FILE_EXT);
   }
+  getEditHistoryFilepathForSuffix(filepath, suffix) {
+    return (0, import_obsidian.normalizePath)(this.editHistoryRootFolder + "/" + filepath + HISTORY_SUFFIX_MARKER + suffix + EDIT_HISTORY_FILE_EXT);
+  }
   getEditHistoryFilepath(filepath) {
-    return (0, import_obsidian.normalizePath)(this.editHistoryRootFolder + "/" + filepath + DEVICE_HISTORY_FILE_MARKER + this.deviceId + EDIT_HISTORY_FILE_EXT);
+    return this.getEditHistoryFilepathForSuffix(filepath, this.getHistoryFileSuffix());
+  }
+  /**
+   * @return the suffix of the active history profile, or the local device id
+   *         if no profile is available
+   */
+  getHistoryFileSuffix() {
+    var _a, _b;
+    return (_b = (_a = this.getActiveHistoryProfile()) == null ? void 0 : _a.suffix) != null ? _b : this.deviceId;
+  }
+  getActiveHistoryProfileName() {
+    const profile = this.getActiveHistoryProfile();
+    if (profile == null) {
+      return this.deviceName;
+    }
+    return profile.name.length > 0 ? profile.name : profile.suffix;
+  }
+  getHistoryProfiles() {
+    var _a;
+    return (_a = this.settings.historyProfiles) != null ? _a : [];
+  }
+  getActiveHistoryProfile() {
+    var _a;
+    const profiles = this.getHistoryProfiles();
+    if (profiles.length == 0) {
+      return null;
+    }
+    return (_a = profiles.find((profile) => profile.id == this.settings.activeHistoryProfileId)) != null ? _a : profiles[0];
+  }
+  getHistoryProfileLabel(profile) {
+    return profile.name.length > 0 ? profile.name + " (" + profile.suffix + ")" : profile.suffix;
+  }
+  /**
+   * @return the suffix of every known history file, active profile first
+   */
+  getHistorySuffixes() {
+    const suffixes = [];
+    const activeProfile = this.getActiveHistoryProfile();
+    if (activeProfile != null) {
+      suffixes.push(activeProfile.suffix);
+    }
+    for (const profile of this.getHistoryProfiles()) {
+      if (!suffixes.includes(profile.suffix)) {
+        suffixes.push(profile.suffix);
+      }
+    }
+    return suffixes;
+  }
+  /**
+   * @return all the history file paths a note may have: one per profile plus
+   *         the legacy shared history path
+   */
+  getEditHistoryFilepaths(filepath) {
+    const filepaths = this.getHistorySuffixes().map((suffix) => this.getEditHistoryFilepathForSuffix(filepath, suffix));
+    filepaths.push(this.getLegacyEditHistoryFilepath(filepath));
+    return Array.from(new Set(filepaths));
+  }
+  /**
+   * Create the default profile out of the local device identity the first
+   * time the plugin runs after upgrading, since the history file paths of
+   * previous versions use the device id as the file name suffix
+   *
+   * @return true if the settings changed and need to be saved
+   */
+  ensureHistoryProfiles() {
+    var _a;
+    const storedProfiles = Array.isArray(this.settings.historyProfiles) ? this.settings.historyProfiles : [];
+    const previousActiveProfileId = this.settings.activeHistoryProfileId;
+    const profiles = [];
+    const seenSuffixes = /* @__PURE__ */ new Set();
+    for (const stored of storedProfiles) {
+      const suffix = normalizeHistorySuffix((_a = stored == null ? void 0 : stored.suffix) != null ? _a : "");
+      if (suffix == null || seenSuffixes.has(suffix)) {
+        logWarn("Ignoring invalid or duplicated history profile suffix", stored == null ? void 0 : stored.suffix);
+        continue;
+      }
+      seenSuffixes.add(suffix);
+      profiles.push({
+        id: typeof stored.id === "string" && stored.id.length > 0 ? stored.id : createDeviceId(),
+        name: typeof stored.name === "string" ? stored.name.trim() : "",
+        suffix
+      });
+    }
+    if (profiles.length == 0) {
+      profiles.push({ id: this.deviceId, name: this.deviceName, suffix: this.deviceId });
+    }
+    if (!profiles.some((profile) => profile.id == this.settings.activeHistoryProfileId)) {
+      this.settings.activeHistoryProfileId = profiles[0].id;
+    }
+    this.settings.historyProfiles = profiles;
+    return JSON.stringify(storedProfiles) != JSON.stringify(profiles) || previousActiveProfileId != this.settings.activeHistoryProfileId;
+  }
+  async setActiveHistoryProfile(profileId) {
+    this.settings.activeHistoryProfileId = profileId;
+    await this.saveSettings();
+  }
+  async setHistoryProfileName(profile, name) {
+    profile.name = name.trim();
+    await this.saveSettings();
+  }
+  /**
+   * @return false if the suffix is invalid, empty, or already used by another
+   *         profile, in which case the stored suffix is kept
+   */
+  async setHistoryProfileSuffix(profile, suffix) {
+    const normalizedSuffix = normalizeHistorySuffix(suffix);
+    if (normalizedSuffix == null) {
+      logWarn("Invalid history profile suffix", suffix);
+      return false;
+    }
+    if (this.getHistoryProfiles().some((other) => other != profile && other.suffix == normalizedSuffix)) {
+      logWarn("History profile suffix already in use", normalizedSuffix);
+      return false;
+    }
+    profile.suffix = normalizedSuffix;
+    await this.saveSettings();
+    return true;
+  }
+  async addHistoryProfile() {
+    const profiles = this.getHistoryProfiles();
+    let suffix = "profile-" + Date.now().toString(36);
+    while (profiles.some((profile2) => profile2.suffix == suffix)) {
+      suffix += "x";
+    }
+    const profile = {
+      id: createDeviceId(),
+      name: DEFAULT_HISTORY_PROFILE_NAME,
+      suffix
+    };
+    this.settings.historyProfiles = [...profiles, profile];
+    this.settings.activeHistoryProfileId = profile.id;
+    await this.saveSettings();
+  }
+  async removeHistoryProfile(profile) {
+    const profiles = this.getHistoryProfiles();
+    if (profiles.length <= 1) {
+      logWarn("Can't remove the last history profile");
+      return;
+    }
+    this.settings.historyProfiles = profiles.filter((other) => other != profile);
+    if (this.settings.activeHistoryProfileId == profile.id) {
+      this.settings.activeHistoryProfileId = this.settings.historyProfiles[0].id;
+    }
+    await this.saveSettings();
+  }
+  /**
+   * @return the note a history file belongs to, or null if no note matches it
+   */
+  resolveHistoryNotePath(historyPath) {
+    const candidates = deriveHistoryNotePathCandidates(historyPath, this.editHistoryRootFolder);
+    if (candidates.length == 0) {
+      return null;
+    }
+    const suffixes = this.getHistorySuffixes();
+    const knownSuffixes = candidates.filter((candidate) => candidate.suffix != null && suffixes.includes(candidate.suffix));
+    const unknownSuffixes = candidates.filter((candidate) => candidate.suffix != null && !suffixes.includes(candidate.suffix));
+    const legacyPaths = candidates.filter((candidate) => candidate.suffix == null);
+    const existingCandidates = [];
+    for (const candidate of [...knownSuffixes, ...unknownSuffixes, ...legacyPaths]) {
+      if (this.app.vault.getAbstractFileByPath(candidate.notePath) instanceof import_obsidian.TFile) {
+        existingCandidates.push(candidate);
+      }
+    }
+    if (existingCandidates.length == 0) {
+      return null;
+    }
+    if (existingCandidates.length > 1) {
+      logWarn(
+        "Ambiguous edit history file, ignoring",
+        historyPath,
+        existingCandidates.map((candidate) => candidate.notePath)
+      );
+      return null;
+    }
+    return existingCandidates[0];
   }
   getFallbackDeviceStorageKey() {
     return DEVICE_STORAGE_KEY + ":" + this.app.vault.getName();
@@ -4600,14 +4941,6 @@ var EditHistory = class extends import_obsidian.Plugin {
     this.deviceName = (_b = stored == null ? void 0 : stored.name) != null ? _b : DEFAULT_DEVICE_NAME;
     this.saveDeviceIdentityToStorage({ id: this.deviceId, name: this.deviceName });
   }
-  setDeviceName(name) {
-    const trimmedName = name.trim();
-    if (trimmedName.length == 0) {
-      return;
-    }
-    this.deviceName = trimmedName;
-    this.saveDeviceIdentityToStorage({ id: this.deviceId, name: this.deviceName });
-  }
   async copyLegacyEditHistoryFile(filepath, legacyFile) {
     const newFilepath = this.getEditHistoryFilepath(filepath);
     try {
@@ -4644,6 +4977,237 @@ var EditHistory = class extends import_obsidian.Plugin {
     }
     return null;
   }
+  async readHistoryVersionsFromFile(file, patchEngine) {
+    try {
+      const zipData = await this.app.vault.readBinary(file);
+      const zip = new import_jszip2.default();
+      await zip.loadAsync(zipData);
+      return await readHistoryVersions(zip, patchEngine);
+    } catch (error) {
+      logError("Can't read edit history file", file.path, error);
+      return { versions: [], error: "can't read the history file" };
+    }
+  }
+  /**
+   * Find the notes whose history is split over several files: the active
+   * profile history file is the merge target and every other variant (legacy
+   * shared files and other profiles or devices) is a merge source
+   */
+  collectHistoryMergeGroups() {
+    const groups = /* @__PURE__ */ new Map();
+    let orphanFiles = 0;
+    let skippedFiles = 0;
+    for (const file of this.app.vault.getFiles()) {
+      if (!file.path.endsWith(EDIT_HISTORY_FILE_EXT)) {
+        continue;
+      }
+      const pathInfo = this.resolveHistoryNotePath(file.path);
+      if (pathInfo == null) {
+        logDbg("Ignoring edit history file without a note", file.path);
+        orphanFiles++;
+        continue;
+      }
+      const note = this.app.vault.getAbstractFileByPath(pathInfo.notePath);
+      if (!(note instanceof import_obsidian.TFile)) {
+        orphanFiles++;
+        continue;
+      }
+      if (!this.keepEditHistoryForFile(note)) {
+        logDbg("Ignoring edit history file of an excluded note", file.path);
+        skippedFiles++;
+        continue;
+      }
+      const targetPath = this.getEditHistoryFilepath(pathInfo.notePath);
+      let group = groups.get(pathInfo.notePath);
+      if (group == null) {
+        group = { notePath: pathInfo.notePath, targetPath, target: null, sources: [] };
+        groups.set(pathInfo.notePath, group);
+      }
+      if (file.path == targetPath) {
+        group.target = file;
+      } else {
+        group.sources.push(file);
+      }
+    }
+    const mergeGroups = Array.from(groups.values()).filter((group) => group.sources.length > 0);
+    return {
+      groups: mergeGroups,
+      historyFileCount: mergeGroups.reduce((count, group) => count + group.sources.length, 0),
+      orphanFiles,
+      skippedFiles
+    };
+  }
+  /**
+   * Merge the history files of one note into the active profile history file.
+   * The merged archive is written before any source file is touched, and
+   * source files holding a version that conflicts with the version kept for
+   * the same second are reported instead of removed
+   */
+  async mergeHistoryGroup(group, patchEngine) {
+    const targetVersions = [];
+    const targetEpochs = /* @__PURE__ */ new Set();
+    if (group.target != null) {
+      const targetResult = await this.readHistoryVersionsFromFile(group.target, patchEngine);
+      if (targetResult.error != null) {
+        throw new Error("can't read " + group.target.path + ": " + targetResult.error);
+      }
+      for (const version of targetResult.versions) {
+        targetEpochs.add(version.epoch);
+      }
+      targetVersions.push(...targetResult.versions);
+    }
+    const versionLists = [targetVersions];
+    const epochContents = new Map(targetVersions.map((version) => [version.epoch, version.content]));
+    const mergedSources = [];
+    const conflictingSources = [];
+    let unreadableSources = 0;
+    for (const source of group.sources) {
+      const sourceResult = await this.readHistoryVersionsFromFile(source, patchEngine);
+      if (sourceResult.error != null) {
+        logError("Can't merge edit history file", source.path, sourceResult.error);
+        unreadableSources++;
+        continue;
+      }
+      let conflicting = false;
+      for (const version of sourceResult.versions) {
+        const existingContent = epochContents.get(version.epoch);
+        if (existingContent == null) {
+          epochContents.set(version.epoch, version.content);
+        } else if (existingContent != version.content) {
+          conflicting = true;
+        }
+      }
+      versionLists.push(sourceResult.versions);
+      if (conflicting) {
+        logWarn("Keeping edit history file with a conflicting version", source.path);
+        conflictingSources.push(source);
+      } else {
+        mergedSources.push(source);
+      }
+    }
+    const merged = mergeHistoryVersionLists(versionLists);
+    const addedVersions = merged.versions.filter((version) => !targetEpochs.has(version.epoch)).length;
+    let skippedDuplicateContent = 0;
+    if (addedVersions > 0) {
+      const mergedHistory = await buildMergedHistoryZip(merged.versions, patchEngine);
+      skippedDuplicateContent = mergedHistory.skippedDuplicateContent;
+      const newZipData = await mergedHistory.zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
+      if (group.target == null) {
+        const dirpath = group.targetPath.substring(0, group.targetPath.lastIndexOf("/") + 1);
+        await this.app.vault.createFolder(dirpath).catch(() => null);
+        const createdFile = await this.app.vault.createBinary(group.targetPath, newZipData);
+        if (createdFile == null) {
+          throw new Error("can't create " + group.targetPath);
+        }
+        group.target = createdFile;
+      } else {
+        await this.app.vault.modifyBinary(group.target, newZipData);
+      }
+      logInfo(
+        "Merged",
+        mergedSources.length,
+        "edit history file(s) into",
+        group.targetPath,
+        "with",
+        addedVersions,
+        "new version(s)"
+      );
+    }
+    return {
+      notePath: group.notePath,
+      mergedSources,
+      conflictingSources,
+      addedVersions,
+      skippedDuplicateContent,
+      unreadableSources
+    };
+  }
+  /**
+   * @return the number of history files that were removed
+   */
+  async cleanMergedHistorySources(files, cleanupMode) {
+    var _a;
+    if (cleanupMode == "keep") {
+      return 0;
+    }
+    let cleanedFiles = 0;
+    for (const file of files) {
+      try {
+        if (cleanupMode == "delete") {
+          await this.app.vault.delete(file);
+        } else {
+          await this.app.vault.trash(file, ((_a = this.settings.deleteToWhere) != null ? _a : "system") === "system");
+        }
+        cleanedFiles++;
+      } catch (error) {
+        logError("Can't remove merged edit history file", file.path, error);
+      }
+    }
+    return cleanedFiles;
+  }
+  async runHistoryMerge(groups, cleanupMode) {
+    if (this.mergeInProgress) {
+      logWarn("Ignoring edit history merge, another merge is already running");
+      new import_obsidian.Notice("An edit history merge is already running", 5e3);
+      return {
+        groups: 0,
+        mergedNotes: 0,
+        addedVersions: 0,
+        alreadyMergedNotes: 0,
+        clearedFiles: 0,
+        keptConflictingFiles: 0,
+        skippedDuplicateVersions: 0,
+        unreadableFiles: 0,
+        errors: 0
+      };
+    }
+    const patchEngine = new import_diff_match_patch_ts.DiffMatchPatch();
+    const result = {
+      groups: groups.length,
+      mergedNotes: 0,
+      addedVersions: 0,
+      alreadyMergedNotes: 0,
+      clearedFiles: 0,
+      keptConflictingFiles: 0,
+      skippedDuplicateVersions: 0,
+      unreadableFiles: 0,
+      errors: 0
+    };
+    this.mergeInProgress = true;
+    const progressNotice = new import_obsidian.Notice("Merging edit histories 0%", 0);
+    try {
+      for (const [index, group] of groups.entries()) {
+        progressNotice.setMessage(
+          `Merging edit histories ${Math.round(100 * index / groups.length)}% (${result.mergedNotes}/${groups.length} notes)`
+        );
+        try {
+          const groupResult = await this.mergeHistoryGroup(group, patchEngine);
+          if (groupResult.addedVersions > 0) {
+            result.mergedNotes++;
+            result.addedVersions += groupResult.addedVersions;
+          } else {
+            result.alreadyMergedNotes++;
+          }
+          result.keptConflictingFiles += groupResult.conflictingSources.length;
+          result.unreadableFiles += groupResult.unreadableSources;
+          result.skippedDuplicateVersions += groupResult.skippedDuplicateContent;
+          result.clearedFiles += await this.cleanMergedHistorySources(groupResult.mergedSources, cleanupMode);
+        } catch (error) {
+          result.errors++;
+          logError("Can't merge the edit history files of", group.notePath, error);
+        }
+      }
+    } finally {
+      this.mergeInProgress = false;
+      progressNotice.hide();
+    }
+    logInfo("Merged edit histories", JSON.stringify(result));
+    new import_obsidian.Notice(
+      `Merged edit histories: ${result.mergedNotes} note(s) and ${result.addedVersions} version(s) merged, ${result.alreadyMergedNotes} already up to date, ${result.clearedFiles} old file(s) removed, ${result.keptConflictingFiles} file(s) kept with conflicting versions, ${result.skippedDuplicateVersions} version(s) skipped as unchanged, ${result.unreadableFiles} unreadable, ${result.errors} error(s)`,
+      15e3
+    );
+    return result;
+  }
   async renameEditHistoryFile(oldPath, newPath, pathBuilder) {
     const oldHistoryFilepath = pathBuilder(oldPath);
     const oldHistoryFile = this.app.vault.getAbstractFileByPath(oldHistoryFilepath);
@@ -4671,7 +5235,7 @@ var EditHistory = class extends import_obsidian.Plugin {
     return zip.file(filepath)._data.compressedSize;
   }
   getEditEpoch(editFilename) {
-    return parseInt(editFilename, 36) * 1e3;
+    return historyEntryEpoch(editFilename);
   }
   getEditDate(editFilename) {
     return new Date(this.getEditEpoch(editFilename));
@@ -4686,12 +5250,10 @@ var EditHistory = class extends import_obsidian.Plugin {
     return t;
   }
   getEditIsDiff(editFilename) {
-    return !editFilename.endsWith("$");
+    return historyEntryIsDiff(editFilename);
   }
   buildEditFilename(mtime, isDiff) {
-    const utcepoch = Math.floor(mtime / 1e3);
-    const editFilename = utcepoch.toString(36) + (isDiff ? "" : "$");
-    return editFilename;
+    return buildHistoryEntryName(mtime, isDiff);
   }
   /**
    * Sort in place
@@ -4731,6 +5293,9 @@ var EditHistory = class extends import_obsidian.Plugin {
   async onload() {
     await this.loadSettings();
     this.loadDeviceIdentity();
+    if (this.ensureHistoryProfiles()) {
+      await this.saveSettings();
+    }
     let dmpobj = new import_diff_match_patch_ts.DiffMatchPatch();
     logInfo("onLoad");
     this.registerEvent(this.app.vault.on("modify", async (fileOrFolder, force = false) => {
@@ -4774,7 +5339,7 @@ var EditHistory = class extends import_obsidian.Plugin {
       }
       let fileData = await this.app.vault.read(file);
       let newFilename = this.buildEditFilename(file.stat.mtime, false);
-      let zip = new import_jszip.default();
+      let zip = new import_jszip2.default();
       let zipData = zipFile == null ? null : await this.app.vault.readBinary(zipFile);
       let numEdits = 0;
       if (zipData != null) {
@@ -4915,7 +5480,13 @@ var EditHistory = class extends import_obsidian.Plugin {
         logDbg("Not moving edit history, expected to be moved later alongside parent folder");
         return;
       }
-      await this.renameEditHistoryFile(oldPath, file.path, (filepath) => this.getEditHistoryFilepath(filepath));
+      for (const suffix of this.getHistorySuffixes()) {
+        await this.renameEditHistoryFile(
+          oldPath,
+          file.path,
+          (filepath) => this.getEditHistoryFilepathForSuffix(filepath, suffix)
+        );
+      }
       await this.renameEditHistoryFile(oldPath, file.path, (filepath) => this.getLegacyEditHistoryFilepath(filepath));
     }));
     this.registerEvent(this.app.vault.on("delete", async (file) => {
@@ -4925,10 +5496,7 @@ var EditHistory = class extends import_obsidian.Plugin {
         logDbg("Ignoring non whitelisted file", file.path);
         return;
       }
-      const historyFilepaths = /* @__PURE__ */ new Set([
-        this.getEditHistoryFilepath(file.path),
-        this.getLegacyEditHistoryFilepath(file.path)
-      ]);
+      const historyFilepaths = this.getEditHistoryFilepaths(file.path);
       for (const historyFilepath of historyFilepaths) {
         const historyFile = this.app.vault.getAbstractFileByPath(historyFilepath);
         if (historyFile != null) {
@@ -4978,6 +5546,13 @@ var EditHistory = class extends import_obsidian.Plugin {
           return true;
         }
         return false;
+      }
+    });
+    this.addCommand({
+      id: "merge-edit-histories",
+      name: "Merge old edit history files into the active history file",
+      callback: () => {
+        new EditHistoryMergeModal(this).open();
       }
     });
     this.addSettingTab(new EditHistorySettingTab(this.app, this));
@@ -5269,7 +5844,7 @@ var EditHistoryModal = class extends import_obsidian.Modal {
     const file = this.app.workspace.getActiveFile();
     this.titleEl.setText("Edits for ");
     this.titleEl.createEl("i", { text: file == null ? void 0 : file.name });
-    this.titleEl.createEl("span", { text: " (" + this.plugin.deviceName + ") " });
+    this.titleEl.createEl("span", { text: " (" + this.plugin.getActiveHistoryProfileName() + ") " });
     const calendarIcon = this.titleEl.createEl("span");
     (0, import_obsidian.setIcon)(calendarIcon, "calendar-plus-2");
     this.modalEl.addClass("edit-history-modal");
@@ -5281,7 +5856,7 @@ var EditHistoryModal = class extends import_obsidian.Modal {
       return;
     }
     const latestData = await this.app.vault.read(file);
-    const zip = new import_jszip.default();
+    const zip = new import_jszip2.default();
     const zipFilepath = this.plugin.getEditHistoryFilepath(file.path);
     logInfo("Opening zip file ", zipFilepath);
     const zipFile = await this.plugin.getEditHistoryFileForRead(file.path);
@@ -5489,9 +6064,61 @@ var EditHistoryModal = class extends import_obsidian.Modal {
     contentEl.empty();
   }
 };
+var EditHistoryMergeModal = class extends import_obsidian.Modal {
+  constructor(plugin) {
+    super(plugin.app);
+    this.cleanupMode = "trash";
+    this.groups = [];
+    this.plugin = plugin;
+  }
+  onOpen() {
+    this.titleEl.setText("Merge old edit histories");
+    const { contentEl } = this;
+    contentEl.addClass("edit-history-merge-modal-content");
+    contentEl.createEl("p", { text: "Merge the old edit history files of every note in this vault (legacy shared files and files of other history profiles or devices) into the edit history file of the active history profile. Merged versions are combined by date, the contents of the note are not modified." });
+    const summaryEl = contentEl.createEl("p", { text: "Scanning the vault\u2026" });
+    const scanResult = this.plugin.collectHistoryMergeGroups();
+    this.groups = scanResult.groups;
+    if (this.groups.length == 0) {
+      summaryEl.setText("No old edit history files found, nothing to merge.");
+    } else {
+      let summary = `${scanResult.historyFileCount} old edit history file(s) of ${this.groups.length} note(s) will be merged into "${this.plugin.getHistoryFileSuffix()}" profile history files.`;
+      if (scanResult.orphanFiles > 0) {
+        summary += ` ${scanResult.orphanFiles} history file(s) without a matching note were ignored.`;
+      }
+      if (scanResult.skippedFiles > 0) {
+        summary += ` ${scanResult.skippedFiles} history file(s) of excluded notes were ignored.`;
+      }
+      summaryEl.setText(summary);
+    }
+    new import_obsidian.Setting(contentEl).setName("Old history files").setDesc("What to do with the old history files after their versions have been merged. Files holding a version that differs from the version kept for the same second are always kept.").addDropdown((dropdown) => dropdown.addOption("trash", "Move them to the trash (default)").addOption("delete", "Delete them permanently").addOption("keep", "Keep them").setValue(this.cleanupMode).onChange((value) => {
+      logInfo("Merged history file cleanup: " + value);
+      this.cleanupMode = value;
+    }));
+    const buttonSetting = new import_obsidian.Setting(contentEl);
+    if (this.groups.length > 0) {
+      buttonSetting.addButton((button) => button.setButtonText("Merge").setCta().onClick(async () => {
+        const groups = this.groups;
+        const cleanupMode = this.cleanupMode;
+        this.close();
+        await this.plugin.runHistoryMerge(groups, cleanupMode);
+      }));
+    }
+    buttonSetting.addButton((button) => button.setButtonText(this.groups.length > 0 ? "Cancel" : "Close").onClick(() => this.close()));
+  }
+  onClose() {
+    logInfo("onClose");
+    const { contentEl } = this;
+    contentEl.empty();
+  }
+};
 var EditHistorySettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
+    // History profiles shown expanded, kept while the settings tab is open so
+    // a re-render (adding, removing or activating a profile) does not lose the
+    // collapse state the user gave to the other profiles
+    this.expandedProfileIds = /* @__PURE__ */ new Set();
     this.plugin = plugin;
   }
   hide() {
@@ -5499,18 +6126,91 @@ var EditHistorySettingTab = class extends import_obsidian.PluginSettingTab {
     super.hide();
   }
   display() {
+    var _a;
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("small", { text: "Created by " }).appendChild(createEl("a", { text: "Antonio Tejada", href: "https://github.com/antoniotejada/" }));
-    containerEl.createEl("h3", { text: "General" });
-    new import_obsidian.Setting(containerEl).setName("Device name").setDesc("A local label for this device. It does not affect history file names or sync.").addText((text) => text.setValue(this.plugin.deviceName).onChange((value) => {
-      if (value.trim().length == 0) {
-        text.setValue(this.plugin.deviceName);
-        return;
+    const historyProfiles = this.plugin.getHistoryProfiles();
+    const activeProfile = this.plugin.getActiveHistoryProfile();
+    for (const profileId of [...this.expandedProfileIds]) {
+      if (!historyProfiles.some((profile) => profile.id == profileId)) {
+        this.expandedProfileIds.delete(profileId);
       }
-      logInfo("Device name: " + value);
-      this.plugin.setDeviceName(value);
+    }
+    let activeProfileDropdown = null;
+    new import_obsidian.Setting(containerEl).setClass("edit-history-profiles-header").setName("History profiles").setDesc(`The selector on this row chooses the history profile used to read and write edit history files, Add profile creates a new one. A history profile selects the suffix of the edit history file name, a note Notes/a.md is stored as Notes/a.md${HISTORY_SUFFIX_MARKER}<suffix>${EDIT_HISTORY_FILE_EXT}. Use the same suffix on every device that should keep a single edit history for this vault. Profiles are stored in the local plugin settings, they are not synchronized with the vault.`).addDropdown((dropdown) => {
+      var _a2;
+      activeProfileDropdown = dropdown;
+      for (const profile of historyProfiles) {
+        dropdown.addOption(profile.id, this.plugin.getHistoryProfileLabel(profile));
+      }
+      dropdown.setValue((_a2 = activeProfile == null ? void 0 : activeProfile.id) != null ? _a2 : "");
+      dropdown.selectEl.setAttribute("aria-label", "Profile used to read and write edit history files");
+      dropdown.onChange(async (value) => {
+        logInfo("Active history profile: " + value);
+        await this.plugin.setActiveHistoryProfile(value);
+        this.display();
+      });
+    }).addButton((button) => button.setButtonText("Add profile").onClick(async () => {
+      logInfo("Adding a history profile");
+      await this.plugin.addHistoryProfile();
+      this.display();
     }));
+    for (const profile of historyProfiles) {
+      const profileEl = containerEl.createEl("details", { cls: "edit-history-profile" });
+      const isActiveProfile = profile.id == (activeProfile == null ? void 0 : activeProfile.id);
+      profileEl.open = isActiveProfile || this.expandedProfileIds.has(profile.id);
+      const summaryEl = profileEl.createEl("summary", { cls: "edit-history-profile-summary" });
+      const labelEl = summaryEl.createEl("span", {
+        cls: "edit-history-profile-label",
+        text: this.plugin.getHistoryProfileLabel(profile)
+      });
+      if (isActiveProfile) {
+        summaryEl.createEl("span", { cls: "edit-history-profile-active", text: "in use" });
+      }
+      profileEl.addEventListener("toggle", () => {
+        if (profileEl.open && !isActiveProfile) {
+          this.expandedProfileIds.add(profile.id);
+        } else {
+          this.expandedProfileIds.delete(profile.id);
+        }
+      });
+      const refreshLabels = () => {
+        const label = this.plugin.getHistoryProfileLabel(profile);
+        labelEl.setText(label);
+        setting.setName(label);
+        const options = activeProfileDropdown == null ? void 0 : activeProfileDropdown.selectEl.options;
+        if (options) {
+          for (let i = 0; i < options.length; i++) {
+            if (options[i].value == profile.id) {
+              options[i].text = label;
+            }
+          }
+        }
+      };
+      const setting = new import_obsidian.Setting(profileEl).setName(this.plugin.getHistoryProfileLabel(profile)).setDesc("Name is a local label shown in the edit history dialog, suffix is part of the history file name").addText((text) => text.setPlaceholder("Name").setValue(profile.name).onChange(async (value) => {
+        logInfo("History profile name: " + value);
+        await this.plugin.setHistoryProfileName(profile, value);
+        refreshLabels();
+      })).addText((text) => text.setPlaceholder("Suffix").setValue(profile.suffix).onChange(async (value) => {
+        if (!await this.plugin.setHistoryProfileSuffix(profile, value)) {
+          text.setValue(profile.suffix);
+        }
+        refreshLabels();
+      }));
+      if (historyProfiles.length > 1) {
+        setting.addExtraButton((button) => button.setIcon("trash").onClick(async () => {
+          logInfo("Removing history profile: " + profile.suffix);
+          await this.plugin.removeHistoryProfile(profile);
+          this.display();
+        }));
+        (_a = setting.controlEl.lastElementChild) == null ? void 0 : _a.setAttribute("aria-label", "Delete this profile, its edit history files are kept");
+      }
+    }
+    new import_obsidian.Setting(containerEl).setName("Merge old edit history files").setDesc("Merge the old edit history files of every note (legacy shared files and files of other profiles or devices) into the edit history file of the active profile").addButton((button) => button.setButtonText("Merge\u2026").onClick(() => {
+      new EditHistoryMergeModal(this.plugin).open();
+    }));
+    containerEl.createEl("h3", { text: "General" });
     new import_obsidian.Setting(containerEl).setName("Minimum seconds between edits").setDesc("Minimum number of seconds that must pass from the previous edit to store a new edit, set to 0 to disable. Modifications done between those seconds will be merged into the next edit, reducing the edit history file size at the expense of less history granularity.").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.minSecondsBetweenEdits).setValue(this.plugin.settings.minSecondsBetweenEdits).onChange(async (value) => {
       logInfo("Minimum seconds between edits: " + value);
       this.plugin.settings.minSecondsBetweenEdits = value;
@@ -5542,8 +6242,8 @@ var EditHistorySettingTab = class extends import_obsidian.PluginSettingTab {
       await this.plugin.saveSettings();
     }));
     new import_obsidian.Setting(containerEl).setName("Delete history files to").setDesc("Choose whether deleted edit history files go to the system trash or the Obsidian .trash folder.").addDropdown((dropdown) => {
-      var _a;
-      return dropdown.addOption("system", "System trash (default)").addOption("obsidian", "Obsidian .trash folder").setValue((_a = this.plugin.settings.deleteToWhere) != null ? _a : DEFAULT_SETTINGS.deleteToWhere).onChange(async (value) => {
+      var _a2;
+      return dropdown.addOption("system", "System trash (default)").addOption("obsidian", "Obsidian .trash folder").setValue((_a2 = this.plugin.settings.deleteToWhere) != null ? _a2 : DEFAULT_SETTINGS.deleteToWhere).onChange(async (value) => {
         logInfo("Delete history files to: " + value);
         this.plugin.settings.deleteToWhere = value;
         await this.plugin.saveSettings();
