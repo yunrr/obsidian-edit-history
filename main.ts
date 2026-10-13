@@ -33,6 +33,22 @@ const enum DiffOp {
 // @ts-ignore: Complains about default export this way, but since jszip 3.10
 // this is the recommended way
 import JSZip from "jszip";
+import {
+    buildHistoryEntryName,
+    buildMergedHistoryZip,
+    deriveHistoryNotePathCandidates,
+    EDIT_HISTORY_FILE_EXT,
+    HistoryPathInfo,
+    HISTORY_SUFFIX_MARKER,
+    HistoryVersion,
+    historyEntryEpoch,
+    historyEntryIsDiff,
+    mergeHistoryVersionLists,
+    normalizeHistorySuffix,
+    PatchEngine,
+    readHistoryVersions,
+    VersionListReadResult,
+} from "./history-merge";
 
 
 // Debuglevels in increasing severity so messages >= indexOf(debugLevel) will be
@@ -123,6 +139,9 @@ interface EditHistorySettings {
     diffDisplayFormat: string;
     showWhitespace: boolean;
     debugLevel: string;
+    // History file name suffixes that can be selected, see EditHistoryProfile
+    historyProfiles: EditHistoryProfile[];
+    activeHistoryProfileId: string;
     // XXX Have color setting for addition fore/back, deletion fore/back 
 }
 
@@ -138,17 +157,69 @@ const DEFAULT_SETTINGS: EditHistorySettings = {
     showOnStatusBar: true,
     diffDisplayFormat: DiffDisplayFormat.Inline,
     showWhitespace: true,
-    debugLevel: "warn"
+    debugLevel: "warn",
+    // Empty so the first profile is created from the local device identity
+    historyProfiles: [],
+    activeHistoryProfileId: "",
 }
 
-const EDIT_HISTORY_FILE_EXT = ".edtz";
-const DEVICE_HISTORY_FILE_MARKER = ".eh-";
 const DEVICE_STORAGE_KEY = "edit-history-device";
 const DEFAULT_DEVICE_NAME = "This device";
+const DEFAULT_HISTORY_PROFILE_NAME = "New profile";
 
 interface EditHistoryDeviceIdentity {
     id: string;
     name: string;
+}
+
+// A history profile selects the suffix of the edit history file name, so using
+// the same suffix on several devices keeps a single edit history for the vault
+interface EditHistoryProfile {
+    id: string;
+    name: string;
+    suffix: string;
+}
+
+// What to do with the old history files once their versions are merged
+type HistoryCleanupMode = "keep" | "trash" | "delete";
+
+interface HistoryMergeGroup {
+    notePath: string;
+    targetPath: string;
+    target: TFile | null;
+    sources: TFile[];
+}
+
+interface HistoryMergeScanResult {
+    groups: HistoryMergeGroup[];
+    historyFileCount: number;
+    orphanFiles: number;
+    skippedFiles: number;
+}
+
+interface HistoryMergeGroupResult {
+    notePath: string;
+    // Old history files whose versions were merged and can be removed
+    mergedSources: TFile[];
+    // Old history files kept because they have a version that differs from the
+    // version kept for the same second
+    conflictingSources: TFile[];
+    addedVersions: number;
+    // Versions whose contents match the next newer kept version, not stored
+    skippedDuplicateContent: number;
+    unreadableSources: number;
+}
+
+interface HistoryMergeResult {
+    groups: number;
+    mergedNotes: number;
+    addedVersions: number;
+    alreadyMergedNotes: number;
+    clearedFiles: number;
+    keptConflictingFiles: number;
+    skippedDuplicateVersions: number;
+    unreadableFiles: number;
+    errors: number;
 }
 
 function createDeviceId(): string {
@@ -190,6 +261,7 @@ export default class EditHistory extends Plugin {
     statusBarItemEl: HTMLElement;
     deviceId: string;
     deviceName: string;
+    mergeInProgress: boolean;
 
     // Minimum number of milliseconds between edits or Infinity, if a
     // modification occurs before that time will be ignored at this moment and
@@ -269,8 +341,213 @@ export default class EditHistory extends Plugin {
         return normalizePath(this.editHistoryRootFolder + "/" + filepath + EDIT_HISTORY_FILE_EXT);
     }
     
+    getEditHistoryFilepathForSuffix(filepath: string, suffix: string): string {
+        return normalizePath(this.editHistoryRootFolder + "/" + filepath + HISTORY_SUFFIX_MARKER + suffix + EDIT_HISTORY_FILE_EXT);
+    }
+
     getEditHistoryFilepath(filepath: string): string {
-        return normalizePath(this.editHistoryRootFolder + "/" + filepath + DEVICE_HISTORY_FILE_MARKER + this.deviceId + EDIT_HISTORY_FILE_EXT);
+        return this.getEditHistoryFilepathForSuffix(filepath, this.getHistoryFileSuffix());
+    }
+
+    /**
+     * @return the suffix of the active history profile, or the local device id
+     *         if no profile is available
+     */
+    getHistoryFileSuffix(): string {
+        return this.getActiveHistoryProfile()?.suffix ?? this.deviceId;
+    }
+
+    getActiveHistoryProfileName(): string {
+        const profile = this.getActiveHistoryProfile();
+        if (profile == null) {
+            return this.deviceName;
+        }
+        return (profile.name.length > 0) ? profile.name : profile.suffix;
+    }
+
+    getHistoryProfiles(): EditHistoryProfile[] {
+        return this.settings.historyProfiles ?? [];
+    }
+
+    getActiveHistoryProfile(): EditHistoryProfile | null {
+        const profiles = this.getHistoryProfiles();
+        if (profiles.length == 0) {
+            return null;
+        }
+        return profiles.find(profile => profile.id == this.settings.activeHistoryProfileId) ?? profiles[0];
+    }
+
+    getHistoryProfileLabel(profile: EditHistoryProfile): string {
+        return (profile.name.length > 0) ? (profile.name + " (" + profile.suffix + ")") : profile.suffix;
+    }
+
+    /**
+     * @return the suffix of every known history file, active profile first
+     */
+    getHistorySuffixes(): string[] {
+        const suffixes: string[] = [];
+        const activeProfile = this.getActiveHistoryProfile();
+        if (activeProfile != null) {
+            suffixes.push(activeProfile.suffix);
+        }
+        for (const profile of this.getHistoryProfiles()) {
+            if (!suffixes.includes(profile.suffix)) {
+                suffixes.push(profile.suffix);
+            }
+        }
+        return suffixes;
+    }
+
+    /**
+     * @return all the history file paths a note may have: one per profile plus
+     *         the legacy shared history path
+     */
+    getEditHistoryFilepaths(filepath: string): string[] {
+        const filepaths = this.getHistorySuffixes()
+            .map(suffix => this.getEditHistoryFilepathForSuffix(filepath, suffix));
+        filepaths.push(this.getLegacyEditHistoryFilepath(filepath));
+        return Array.from(new Set(filepaths));
+    }
+
+    /**
+     * Create the default profile out of the local device identity the first
+     * time the plugin runs after upgrading, since the history file paths of
+     * previous versions use the device id as the file name suffix
+     *
+     * @return true if the settings changed and need to be saved
+     */
+    ensureHistoryProfiles(): boolean {
+        const storedProfiles = Array.isArray(this.settings.historyProfiles) ? this.settings.historyProfiles : [];
+        const previousActiveProfileId = this.settings.activeHistoryProfileId;
+        const profiles: EditHistoryProfile[] = [];
+        const seenSuffixes = new Set<string>();
+
+        for (const stored of storedProfiles) {
+            const suffix = normalizeHistorySuffix(stored?.suffix ?? "");
+            if ((suffix == null) || seenSuffixes.has(suffix)) {
+                logWarn("Ignoring invalid or duplicated history profile suffix", stored?.suffix);
+                continue;
+            }
+            seenSuffixes.add(suffix);
+            profiles.push({
+                id: (typeof stored.id === "string" && stored.id.length > 0) ? stored.id : createDeviceId(),
+                name: (typeof stored.name === "string") ? stored.name.trim() : "",
+                suffix: suffix,
+            });
+        }
+
+        if (profiles.length == 0) {
+            profiles.push({ id: this.deviceId, name: this.deviceName, suffix: this.deviceId });
+        }
+
+        if (!profiles.some(profile => profile.id == this.settings.activeHistoryProfileId)) {
+            this.settings.activeHistoryProfileId = profiles[0].id;
+        }
+        this.settings.historyProfiles = profiles;
+
+        return (JSON.stringify(storedProfiles) != JSON.stringify(profiles)) ||
+            (previousActiveProfileId != this.settings.activeHistoryProfileId);
+    }
+
+    async setActiveHistoryProfile(profileId: string): Promise<void> {
+        this.settings.activeHistoryProfileId = profileId;
+        await this.saveSettings();
+    }
+
+    async setHistoryProfileName(profile: EditHistoryProfile, name: string): Promise<void> {
+        profile.name = name.trim();
+        await this.saveSettings();
+    }
+
+    /**
+     * @return false if the suffix is invalid, empty, or already used by another
+     *         profile, in which case the stored suffix is kept
+     */
+    async setHistoryProfileSuffix(profile: EditHistoryProfile, suffix: string): Promise<boolean> {
+        const normalizedSuffix = normalizeHistorySuffix(suffix);
+        if (normalizedSuffix == null) {
+            logWarn("Invalid history profile suffix", suffix);
+            return false;
+        }
+        if (this.getHistoryProfiles().some(other => (other != profile) && (other.suffix == normalizedSuffix))) {
+            logWarn("History profile suffix already in use", normalizedSuffix);
+            return false;
+        }
+
+        profile.suffix = normalizedSuffix;
+        await this.saveSettings();
+        return true;
+    }
+
+    async addHistoryProfile(): Promise<void> {
+        const profiles = this.getHistoryProfiles();
+        let suffix = "profile-" + Date.now().toString(36);
+        while (profiles.some(profile => profile.suffix == suffix)) {
+            suffix += "x";
+        }
+
+        const profile: EditHistoryProfile = {
+            id: createDeviceId(),
+            name: DEFAULT_HISTORY_PROFILE_NAME,
+            suffix: suffix,
+        };
+        this.settings.historyProfiles = [...profiles, profile];
+        this.settings.activeHistoryProfileId = profile.id;
+        await this.saveSettings();
+    }
+
+    async removeHistoryProfile(profile: EditHistoryProfile): Promise<void> {
+        const profiles = this.getHistoryProfiles();
+        if (profiles.length <= 1) {
+            logWarn("Can't remove the last history profile");
+            return;
+        }
+
+        this.settings.historyProfiles = profiles.filter(other => other != profile);
+        if (this.settings.activeHistoryProfileId == profile.id) {
+            this.settings.activeHistoryProfileId = this.settings.historyProfiles[0].id;
+        }
+        await this.saveSettings();
+    }
+
+    /**
+     * @return the note a history file belongs to, or null if no note matches it
+     */
+    resolveHistoryNotePath(historyPath: string): HistoryPathInfo | null {
+        const candidates = deriveHistoryNotePathCandidates(historyPath, this.editHistoryRootFolder);
+        if (candidates.length == 0) {
+            return null;
+        }
+
+        // Prefer a suffix of a known profile, then any other suffixed history
+        // file (eg a device id of another device), and only then the legacy
+        // shared path. A note named "a.eh-b.md" makes this ambiguous, so the
+        // note has to exist for the path to be accepted
+        const suffixes = this.getHistorySuffixes();
+        const knownSuffixes = candidates.filter(candidate => (candidate.suffix != null) && suffixes.includes(candidate.suffix));
+        const unknownSuffixes = candidates.filter(candidate => (candidate.suffix != null) && !suffixes.includes(candidate.suffix));
+        const legacyPaths = candidates.filter(candidate => candidate.suffix == null);
+
+        const existingCandidates: HistoryPathInfo[] = [];
+        for (const candidate of [...knownSuffixes, ...unknownSuffixes, ...legacyPaths]) {
+            if (this.app.vault.getAbstractFileByPath(candidate.notePath) instanceof TFile) {
+                existingCandidates.push(candidate);
+            }
+        }
+
+        if (existingCandidates.length == 0) {
+            return null;
+        }
+        if (existingCandidates.length > 1) {
+            // More than one existing note matches this history file name (eg a
+            // note named "a.eh-b.md" next to "a.md"), leave the file alone
+            // rather than merging it into the wrong note
+            logWarn("Ambiguous edit history file, ignoring", historyPath,
+                existingCandidates.map(candidate => candidate.notePath));
+            return null;
+        }
+
+        return existingCandidates[0];
     }
 
     getFallbackDeviceStorageKey(): string {
@@ -321,16 +598,6 @@ export default class EditHistory extends Plugin {
         this.saveDeviceIdentityToStorage({ id: this.deviceId, name: this.deviceName });
     }
 
-    setDeviceName(name: string): void {
-        const trimmedName = name.trim();
-        if (trimmedName.length == 0) {
-            return;
-        }
-
-        this.deviceName = trimmedName;
-        this.saveDeviceIdentityToStorage({ id: this.deviceId, name: this.deviceName });
-    }
-
     async copyLegacyEditHistoryFile(filepath: string, legacyFile: TFile): Promise<TFile | null> {
         const newFilepath = this.getEditHistoryFilepath(filepath);
         try {
@@ -370,6 +637,252 @@ export default class EditHistory extends Plugin {
         return null;
     }
 
+    async readHistoryVersionsFromFile(file: TFile, patchEngine: PatchEngine): Promise<VersionListReadResult> {
+        try {
+            const zipData = await this.app.vault.readBinary(file);
+            const zip = new JSZip();
+            await zip.loadAsync(zipData);
+            return await readHistoryVersions(zip, patchEngine);
+        } catch (error) {
+            logError("Can't read edit history file", file.path, error);
+            return { versions: [], error: "can't read the history file" };
+        }
+    }
+
+    /**
+     * Find the notes whose history is split over several files: the active
+     * profile history file is the merge target and every other variant (legacy
+     * shared files and other profiles or devices) is a merge source
+     */
+    collectHistoryMergeGroups(): HistoryMergeScanResult {
+        const groups = new Map<string, HistoryMergeGroup>();
+        let orphanFiles = 0;
+        let skippedFiles = 0;
+
+        for (const file of this.app.vault.getFiles()) {
+            if (!file.path.endsWith(EDIT_HISTORY_FILE_EXT)) {
+                continue;
+            }
+
+            const pathInfo = this.resolveHistoryNotePath(file.path);
+            if (pathInfo == null) {
+                logDbg("Ignoring edit history file without a note", file.path);
+                orphanFiles++;
+                continue;
+            }
+
+            const note = this.app.vault.getAbstractFileByPath(pathInfo.notePath);
+            if (!(note instanceof TFile)) {
+                orphanFiles++;
+                continue;
+            }
+            if (!this.keepEditHistoryForFile(note)) {
+                logDbg("Ignoring edit history file of an excluded note", file.path);
+                skippedFiles++;
+                continue;
+            }
+
+            const targetPath = this.getEditHistoryFilepath(pathInfo.notePath);
+            let group = groups.get(pathInfo.notePath);
+            if (group == null) {
+                group = { notePath: pathInfo.notePath, targetPath: targetPath, target: null, sources: [] };
+                groups.set(pathInfo.notePath, group);
+            }
+
+            if (file.path == targetPath) {
+                group.target = file;
+            } else {
+                group.sources.push(file);
+            }
+        }
+
+        const mergeGroups = Array.from(groups.values()).filter(group => group.sources.length > 0);
+        return {
+            groups: mergeGroups,
+            historyFileCount: mergeGroups.reduce((count, group) => count + group.sources.length, 0),
+            orphanFiles: orphanFiles,
+            skippedFiles: skippedFiles,
+        };
+    }
+
+    /**
+     * Merge the history files of one note into the active profile history file.
+     * The merged archive is written before any source file is touched, and
+     * source files holding a version that conflicts with the version kept for
+     * the same second are reported instead of removed
+     */
+    async mergeHistoryGroup(group: HistoryMergeGroup, patchEngine: PatchEngine): Promise<HistoryMergeGroupResult> {
+        const targetVersions: HistoryVersion[] = [];
+        const targetEpochs = new Set<number>();
+        if (group.target != null) {
+            const targetResult = await this.readHistoryVersionsFromFile(group.target, patchEngine);
+            if (targetResult.error != null) {
+                throw new Error("can't read " + group.target.path + ": " + targetResult.error);
+            }
+            for (const version of targetResult.versions) {
+                targetEpochs.add(version.epoch);
+            }
+            targetVersions.push(...targetResult.versions);
+        }
+
+        const versionLists: HistoryVersion[][] = [targetVersions];
+        const epochContents = new Map<number, string>(targetVersions.map(version => [version.epoch, version.content]));
+        const mergedSources: TFile[] = [];
+        const conflictingSources: TFile[] = [];
+        let unreadableSources = 0;
+
+        for (const source of group.sources) {
+            const sourceResult = await this.readHistoryVersionsFromFile(source, patchEngine);
+            if (sourceResult.error != null) {
+                logError("Can't merge edit history file", source.path, sourceResult.error);
+                unreadableSources++;
+                continue;
+            }
+
+            // A source whose version differs from the version already kept for
+            // the same second keeps its file, so nothing is silently lost
+            let conflicting = false;
+            for (const version of sourceResult.versions) {
+                const existingContent = epochContents.get(version.epoch);
+                if (existingContent == null) {
+                    epochContents.set(version.epoch, version.content);
+                } else if (existingContent != version.content) {
+                    conflicting = true;
+                }
+            }
+
+            versionLists.push(sourceResult.versions);
+            if (conflicting) {
+                logWarn("Keeping edit history file with a conflicting version", source.path);
+                conflictingSources.push(source);
+            } else {
+                mergedSources.push(source);
+            }
+        }
+
+        const merged = mergeHistoryVersionLists(versionLists);
+        const addedVersions = merged.versions.filter(version => !targetEpochs.has(version.epoch)).length;
+
+        let skippedDuplicateContent = 0;
+        if (addedVersions > 0) {
+            const mergedHistory = await buildMergedHistoryZip(merged.versions, patchEngine);
+            skippedDuplicateContent = mergedHistory.skippedDuplicateContent;
+            const newZipData = await mergedHistory.zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
+
+            if (group.target == null) {
+                const dirpath = group.targetPath.substring(0, group.targetPath.lastIndexOf("/") + 1);
+                await this.app.vault.createFolder(dirpath).catch(() => null);
+                const createdFile = await this.app.vault.createBinary(group.targetPath, newZipData);
+                if (createdFile == null) {
+                    throw new Error("can't create " + group.targetPath);
+                }
+                group.target = createdFile;
+            } else {
+                await this.app.vault.modifyBinary(group.target, newZipData);
+            }
+            logInfo("Merged", mergedSources.length, "edit history file(s) into", group.targetPath,
+                "with", addedVersions, "new version(s)");
+        }
+
+        return {
+            notePath: group.notePath,
+            mergedSources: mergedSources,
+            conflictingSources: conflictingSources,
+            addedVersions: addedVersions,
+            skippedDuplicateContent: skippedDuplicateContent,
+            unreadableSources: unreadableSources,
+        };
+    }
+
+    /**
+     * @return the number of history files that were removed
+     */
+    async cleanMergedHistorySources(files: TFile[], cleanupMode: HistoryCleanupMode): Promise<number> {
+        if (cleanupMode == "keep") {
+            return 0;
+        }
+
+        let cleanedFiles = 0;
+        for (const file of files) {
+            try {
+                if (cleanupMode == "delete") {
+                    await this.app.vault.delete(file);
+                } else {
+                    await this.app.vault.trash(file, (this.settings.deleteToWhere ?? "system") === "system");
+                }
+                cleanedFiles++;
+            } catch (error) {
+                logError("Can't remove merged edit history file", file.path, error);
+            }
+        }
+        return cleanedFiles;
+    }
+
+    async runHistoryMerge(groups: HistoryMergeGroup[], cleanupMode: HistoryCleanupMode): Promise<HistoryMergeResult> {
+        if (this.mergeInProgress) {
+            logWarn("Ignoring edit history merge, another merge is already running");
+            new Notice("An edit history merge is already running", 5000);
+            return {
+                groups: 0, mergedNotes: 0, addedVersions: 0, alreadyMergedNotes: 0,
+                clearedFiles: 0, keptConflictingFiles: 0, skippedDuplicateVersions: 0,
+                unreadableFiles: 0, errors: 0,
+            };
+        }
+
+        const patchEngine = new DiffMatchPatch();
+        const result: HistoryMergeResult = {
+            groups: groups.length,
+            mergedNotes: 0,
+            addedVersions: 0,
+            alreadyMergedNotes: 0,
+            clearedFiles: 0,
+            keptConflictingFiles: 0,
+            skippedDuplicateVersions: 0,
+            unreadableFiles: 0,
+            errors: 0,
+        };
+
+        // Guard against overlapping merges, a second run could otherwise
+        // interleave with this one on the same history files
+        this.mergeInProgress = true;
+        const progressNotice = new Notice("Merging edit histories 0%", 0);
+        try {
+            for (const [index, group] of groups.entries()) {
+                progressNotice.setMessage(
+                    `Merging edit histories ${Math.round(100 * index / groups.length)}% (${result.mergedNotes}/${groups.length} notes)`);
+                try {
+                    const groupResult = await this.mergeHistoryGroup(group, patchEngine);
+                    if (groupResult.addedVersions > 0) {
+                        result.mergedNotes++;
+                        result.addedVersions += groupResult.addedVersions;
+                    } else {
+                        result.alreadyMergedNotes++;
+                    }
+                    result.keptConflictingFiles += groupResult.conflictingSources.length;
+                    result.unreadableFiles += groupResult.unreadableSources;
+                    result.skippedDuplicateVersions += groupResult.skippedDuplicateContent;
+                    result.clearedFiles += await this.cleanMergedHistorySources(groupResult.mergedSources, cleanupMode);
+                } catch (error) {
+                    result.errors++;
+                    logError("Can't merge the edit history files of", group.notePath, error);
+                }
+            }
+        } finally {
+            this.mergeInProgress = false;
+            progressNotice.hide();
+        }
+
+        logInfo("Merged edit histories", JSON.stringify(result));
+        new Notice(
+            `Merged edit histories: ${result.mergedNotes} note(s) and ${result.addedVersions} version(s) merged, ` +
+            `${result.alreadyMergedNotes} already up to date, ${result.clearedFiles} old file(s) removed, ` +
+            `${result.keptConflictingFiles} file(s) kept with conflicting versions, ` +
+            `${result.skippedDuplicateVersions} version(s) skipped as unchanged, ` +
+            `${result.unreadableFiles} unreadable, ${result.errors} error(s)`, 15000);
+
+        return result;
+    }
+
     async renameEditHistoryFile(oldPath: string, newPath: string, pathBuilder: (filepath: string) => string): Promise<void> {
         const oldHistoryFilepath = pathBuilder(oldPath);
         const oldHistoryFile = this.app.vault.getAbstractFileByPath(oldHistoryFilepath);
@@ -404,7 +917,7 @@ export default class EditHistory extends Plugin {
     }
     
     getEditEpoch(editFilename: string): number {
-        return parseInt(editFilename, 36) * 1000;
+        return historyEntryEpoch(editFilename);
     }
 
     getEditDate(editFilename: string): Date {
@@ -424,13 +937,11 @@ export default class EditHistory extends Plugin {
     }
 
     getEditIsDiff(editFilename: string): boolean {
-        return !editFilename.endsWith("$");
+        return historyEntryIsDiff(editFilename);
     }
     
     buildEditFilename(mtime: number, isDiff: boolean): string {
-        const utcepoch = Math.floor(mtime / 1000);
-        const editFilename = utcepoch.toString(36) + (isDiff ? "" : "$"); 
-        return editFilename;
+        return buildHistoryEntryName(mtime, isDiff);
     }
 
     /**
@@ -493,6 +1004,11 @@ export default class EditHistory extends Plugin {
         // Load settings as early as possible console output is seen if enabled
         await this.loadSettings();
         this.loadDeviceIdentity();
+        // The local device identity seeds the default history profile on the
+        // first run after upgrading from device-only history file names
+        if (this.ensureHistoryProfiles()) {
+            await this.saveSettings();
+        }
 
         // XXX Make this a member variable?
         let dmpobj = new DiffMatchPatch();
@@ -890,8 +1406,12 @@ export default class EditHistory extends Plugin {
                 return;
             }
 
-            // Rename both the current device history and any legacy shared history.
-            await this.renameEditHistoryFile(oldPath, file.path, (filepath) => this.getEditHistoryFilepath(filepath));
+            // Rename the history file of every profile and any legacy shared
+            // history
+            for (const suffix of this.getHistorySuffixes()) {
+                await this.renameEditHistoryFile(oldPath, file.path,
+                    (filepath) => this.getEditHistoryFilepathForSuffix(filepath, suffix));
+            }
             await this.renameEditHistoryFile(oldPath, file.path, (filepath) => this.getLegacyEditHistoryFilepath(filepath));
         }));
 
@@ -903,11 +1423,9 @@ export default class EditHistory extends Plugin {
                 logDbg("Ignoring non whitelisted file", file.path);
                 return;
             }
-            // Delete current device and legacy shared history files if present.
-            const historyFilepaths = new Set([
-                this.getEditHistoryFilepath(file.path),
-                this.getLegacyEditHistoryFilepath(file.path),
-            ]);
+            // Delete the history files of every profile and any legacy shared
+            // history if present.
+            const historyFilepaths = this.getEditHistoryFilepaths(file.path);
             for (const historyFilepath of historyFilepaths) {
                 const historyFile = this.app.vault.getAbstractFileByPath(historyFilepath);
                 if (historyFile != null) {
@@ -967,6 +1485,15 @@ export default class EditHistory extends Plugin {
                     return true;
                 } 
                 return false;
+            }
+        });
+
+
+        this.addCommand({
+            id: "merge-edit-histories",
+            name: "Merge old edit history files into the active history file",
+            callback: () => {
+                new EditHistoryMergeModal(this).open();
             }
         });
 
@@ -1462,7 +1989,7 @@ class EditHistoryModal extends Modal {
 
         this.titleEl.setText("Edits for ");
         this.titleEl.createEl("i", { text: file?.name });
-        this.titleEl.createEl("span", { text: " (" + this.plugin.deviceName + ") " });
+        this.titleEl.createEl("span", { text: " (" + this.plugin.getActiveHistoryProfileName() + ") " });
 
         const calendarIcon = this.titleEl.createEl("span")
         // XXX This icon is not visible on mobile on some older versions,
@@ -1857,6 +2384,86 @@ class EditHistoryModal extends Modal {
     }
 }
 
+class EditHistoryMergeModal extends Modal {
+    plugin: EditHistory;
+    cleanupMode: HistoryCleanupMode = "trash";
+    groups: HistoryMergeGroup[] = [];
+
+    constructor(plugin: EditHistory) {
+        super(plugin.app);
+        this.plugin = plugin;
+    }
+
+    onOpen(): void {
+        this.titleEl.setText("Merge old edit histories");
+
+        const {contentEl} = this;
+        contentEl.addClass("edit-history-merge-modal-content");
+
+        contentEl.createEl("p", { text:
+            "Merge the old edit history files of every note in this vault (legacy shared files and files of other history profiles or devices) " +
+            "into the edit history file of the active history profile. Merged versions are combined by date, the contents of the note are not modified." });
+
+        const summaryEl = contentEl.createEl("p", { text: "Scanning the vault…" });
+
+        const scanResult = this.plugin.collectHistoryMergeGroups();
+        this.groups = scanResult.groups;
+
+        if (this.groups.length == 0) {
+            summaryEl.setText("No old edit history files found, nothing to merge.");
+        } else {
+            let summary = `${scanResult.historyFileCount} old edit history file(s) of ${this.groups.length} note(s) ` +
+                `will be merged into "${this.plugin.getHistoryFileSuffix()}" profile history files.`;
+            if (scanResult.orphanFiles > 0) {
+                summary += ` ${scanResult.orphanFiles} history file(s) without a matching note were ignored.`;
+            }
+            if (scanResult.skippedFiles > 0) {
+                summary += ` ${scanResult.skippedFiles} history file(s) of excluded notes were ignored.`;
+            }
+            summaryEl.setText(summary);
+        }
+
+        new Setting(contentEl)
+            .setName("Old history files")
+            .setDesc("What to do with the old history files after their versions have been merged. " +
+                "Files holding a version that differs from the version kept for the same second are always kept.")
+            .addDropdown(dropdown => dropdown
+                .addOption("trash", "Move them to the trash (default)")
+                .addOption("delete", "Delete them permanently")
+                .addOption("keep", "Keep them")
+                .setValue(this.cleanupMode)
+                .onChange(value => {
+                    logInfo("Merged history file cleanup: " + value);
+                    this.cleanupMode = value as HistoryCleanupMode;
+                }));
+
+        // Note the merge button is not added when there is nothing to merge,
+        // since ButtonComponent.setDisabled needs Obsidian 1.2.3 while this
+        // plugin supports 0.15.0
+        const buttonSetting = new Setting(contentEl);
+        if (this.groups.length > 0) {
+            buttonSetting.addButton(button => button
+                .setButtonText("Merge")
+                .setCta()
+                .onClick(async () => {
+                    const groups = this.groups;
+                    const cleanupMode = this.cleanupMode;
+                    this.close();
+                    await this.plugin.runHistoryMerge(groups, cleanupMode);
+                }));
+        }
+        buttonSetting.addButton(button => button
+            .setButtonText(this.groups.length > 0 ? "Cancel" : "Close")
+            .onClick(() => this.close()));
+    }
+
+    onClose(): void {
+        logInfo("onClose");
+        const {contentEl} = this;
+        contentEl.empty();
+    }
+}
+
 class EditHistorySettingTab extends PluginSettingTab { plugin:
     EditHistory;
 
@@ -1878,21 +2485,107 @@ class EditHistorySettingTab extends PluginSettingTab { plugin:
 
         // h2 is abnormally small in settings, start with h3 which has the right
         // size (other plugins do the same)
-        containerEl.createEl("h3", {text: "General"});
+        containerEl.createEl("h3", {text: "History profiles"});
+
+        containerEl.createEl("div", { text:
+            "A history profile selects the suffix of the edit history file name, a note Notes/a.md is stored as " +
+            `Notes/a.md${HISTORY_SUFFIX_MARKER}<suffix>${EDIT_HISTORY_FILE_EXT}. ` +
+            "Use the same suffix on every device that should keep a single edit history for this vault. " +
+            "Profiles are stored in the local plugin settings, they are not synchronized with the vault." });
+
+        const historyProfiles = this.plugin.getHistoryProfiles();
+        let activeProfileDropdown: DropdownComponent | null = null;
+        new Setting(containerEl)
+            .setName("Active profile")
+            .setDesc("Profile used to read and write edit history files")
+            .addDropdown(dropdown => {
+                activeProfileDropdown = dropdown;
+                for (const profile of historyProfiles) {
+                    dropdown.addOption(profile.id, this.plugin.getHistoryProfileLabel(profile));
+                }
+                dropdown.setValue(this.plugin.getActiveHistoryProfile()?.id ?? "");
+                dropdown.onChange(async (value) => {
+                    logInfo("Active history profile: " + value);
+                    await this.plugin.setActiveHistoryProfile(value);
+                    this.display();
+                });
+            });
+
+        for (const profile of historyProfiles) {
+            // Update the labels in place on every change, a full re-render
+            // would lose the focus of the text field being edited
+            const refreshLabels = () => {
+                setting.setName(this.plugin.getHistoryProfileLabel(profile));
+                const options = activeProfileDropdown?.selectEl.options;
+                if (options) {
+                    for (let i = 0; i < options.length; i++) {
+                        if (options[i].value == profile.id) {
+                            options[i].text = this.plugin.getHistoryProfileLabel(profile);
+                        }
+                    }
+                }
+            };
+
+            const setting = new Setting(containerEl)
+                .setName(this.plugin.getHistoryProfileLabel(profile))
+                .setDesc("Name is a local label shown in the edit history dialog, suffix is part of the history file name")
+                .addText(text => text
+                    .setPlaceholder("Name")
+                    .setValue(profile.name)
+                    .onChange(async (value) => {
+                        logInfo("History profile name: " + value);
+                        await this.plugin.setHistoryProfileName(profile, value);
+                        refreshLabels();
+                    }))
+                .addText(text => text
+                    .setPlaceholder("Suffix")
+                    .setValue(profile.suffix)
+                    .onChange(async (value) => {
+                        if (!(await this.plugin.setHistoryProfileSuffix(profile, value))) {
+                            // Reject empty, invalid or duplicated suffixes, keep
+                            // the stored one instead
+                            text.setValue(profile.suffix);
+                        }
+                        refreshLabels();
+                    }));
+            // Note the last profile can't be removed, so the button is only
+            // added when there is more than one profile. Also note
+            // ExtraButtonComponent.setTooltip/setDisabled need Obsidian 1.1.0
+            // and 1.2.3 while this plugin supports 0.15.0, so only the element
+            // and icon APIs available since 0.9.7/0.9.16 are used
+            if (historyProfiles.length > 1) {
+                setting.addExtraButton(button => button
+                    .setIcon("trash")
+                    .onClick(async () => {
+                        logInfo("Removing history profile: " + profile.suffix);
+                        await this.plugin.removeHistoryProfile(profile);
+                        this.display();
+                    }));
+                setting.controlEl.lastElementChild?.setAttribute("aria-label", "Delete this profile, its edit history files are kept");
+            }
+        }
 
         new Setting(containerEl)
-            .setName("Device name")
-            .setDesc("A local label for this device. It does not affect history file names or sync.")
-            .addText(text => text
-                .setValue(this.plugin.deviceName)
-                .onChange((value) => {
-                    if (value.trim().length == 0) {
-                        text.setValue(this.plugin.deviceName);
-                        return;
-                    }
-                    logInfo("Device name: " + value);
-                    this.plugin.setDeviceName(value);
+            .setName("Add profile")
+            .setDesc("Add a history profile and make it the active profile")
+            .addButton(button => button
+                .setButtonText("Add")
+                .onClick(async () => {
+                    await this.plugin.addHistoryProfile();
+                    this.display();
                 }));
+
+        new Setting(containerEl)
+            .setName("Merge old edit history files")
+            .setDesc("Merge the old edit history files of every note (legacy shared files and files of other profiles or devices) " +
+                "into the edit history file of the active profile")
+            .addButton(button => button
+                .setButtonText("Merge…")
+                .onClick(() => {
+                    new EditHistoryMergeModal(this.plugin).open();
+                }));
+
+        containerEl.createEl("h3", {text: "General"});
 
         new Setting(containerEl)
             .setName("Minimum seconds between edits")

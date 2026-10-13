@@ -27,8 +27,8 @@ This is similar to the [File Recovery](https://help.obsidian.md/Plugins/File+rec
 - The edit history file is automatically managed when modifications are done to the note under Obsidian
   - renamed when the note is renamed (including folder changes).
   - deleted when the note is deleted
-- Edit history files are kept separately per device, so vault file synchronization does not merge device histories
-- Device-specific history storage works on desktop and mobile; the device label is stored locally per vault
+- Edit history files are kept separately per history profile; the file name suffix is selectable in settings, so using the same suffix on several devices keeps one shared edit history
+- Manually merge old edit history files (legacy shared files and files of other devices or profiles) into the active profile history
 - Edit history files can be safely deleted outside of Obsidian in order to free storage.
 - Keep edit history files for all files or just for the extensions specified in the settings
 - Don't keep edit history files for those filepaths containing the substrings specified in the settings
@@ -45,12 +45,15 @@ This is similar to the [File Recovery](https://help.obsidian.md/Plugins/File+rec
   - Insertions are shown as green, deletions as red
   - Copy the current edit with the Copy button
   - Navigate through diffs in this edit via keyboard or the Previous/Next buttons
+- Invoke the command *Edit History: Merge old edit history files into the active history file* (or use the corresponding settings button) after moving to a device or changing the active profile. Old history files can be kept, moved to the trash, or deleted permanently after the merge
 
 ## The edit history file
 
-The plugin creates one device-specific edit history (.edtz) file per note, in the same folder as the note. For example, a note named `Notes/a.md` has a history file like `Notes/a.md.eh-<device-id>.edtz`.
+The plugin creates one edit history (.edtz) file per note, in the same folder as the note. The file name is the note path plus the suffix of the active history profile. For example, a note named `Notes/a.md` with the profile suffix `laptop` has a history file named `Notes/a.md.eh-laptop.edtz`.
 
-The device name is a local label stored separately on each device. Renaming the label does not rename or move history files. Existing shared history files named `Notes/a.md.edtz` are copied to the current device history the first time the note history is opened or updated. The old shared file is retained until it is no longer needed by other devices.
+History profiles are listed in the plugin settings, where the active profile can be selected and its suffix edited. Profiles and the active profile are stored in the local plugin settings, they are not synchronized with the vault, so give the same suffix to every device that should share one edit history for the vault. Upgrading from an older version creates the default profile from the local device id, which keeps the history file names of the previous version unchanged.
+
+Existing shared history files named `Notes/a.md.edtz` are copied to the active profile history the first time the note history is opened or updated. The old shared file is retained until it is no longer needed, and files of other profiles or devices are left alone. Use the merge command to combine all of them into the active profile history file, and to remove the old files.
 
 ### Format
 
@@ -61,6 +64,12 @@ The most recent version of the note is always stored in full in the zip file, so
 This most recent version may not be the latest version of the note if a non-zero time between edits was set.
 
 Each entry in the file is named after the UTC epoch in seconds at which time the edit was made, encoded as chars, and ending in "$" if the entry is stored in full, otherwise stored as a diff.
+
+### Merging old history files
+
+The merge command (and the corresponding settings button) scans the whole vault and merges, for every note, the versions of all its other history files (the legacy shared file and the files of other profiles or devices) into the active profile history file. Versions are combined by date and re-encoded, the note itself is not modified.
+
+Entries are identified by their second-precision timestamp, so when two files store a version for the same second the version of the active profile history file is kept and the other file is reported and kept instead of being removed. Old files that can be removed are kept, moved to the trash, or deleted permanently, depending on the choice in the merge dialog. Removing them is only done after the merged history file has been written.
 
 ## Versions
 
