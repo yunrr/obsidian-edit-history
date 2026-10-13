@@ -6115,10 +6115,10 @@ var EditHistoryMergeModal = class extends import_obsidian.Modal {
 var EditHistorySettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
-    // History profiles shown expanded, kept while the settings tab is open so
-    // a re-render (adding, removing or activating a profile) does not lose the
-    // collapse state the user gave to the other profiles
-    this.expandedProfileIds = /* @__PURE__ */ new Set();
+    // Whether the history profiles block is expanded, kept while the settings
+    // tab is open so a re-render (adding, removing or activating a profile)
+    // does not change it. Note it is deliberately not stored in the settings
+    this.historyProfilesExpanded = false;
     this.plugin = plugin;
   }
   hide() {
@@ -6130,86 +6130,6 @@ var EditHistorySettingTab = class extends import_obsidian.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("small", { text: "Created by " }).appendChild(createEl("a", { text: "Antonio Tejada", href: "https://github.com/antoniotejada/" }));
-    const historyProfiles = this.plugin.getHistoryProfiles();
-    const activeProfile = this.plugin.getActiveHistoryProfile();
-    for (const profileId of [...this.expandedProfileIds]) {
-      if (!historyProfiles.some((profile) => profile.id == profileId)) {
-        this.expandedProfileIds.delete(profileId);
-      }
-    }
-    let activeProfileDropdown = null;
-    new import_obsidian.Setting(containerEl).setClass("edit-history-profiles-header").setName("History profiles").setDesc(`The selector on this row chooses the history profile used to read and write edit history files, Add profile creates a new one. A history profile selects the suffix of the edit history file name, a note Notes/a.md is stored as Notes/a.md${HISTORY_SUFFIX_MARKER}<suffix>${EDIT_HISTORY_FILE_EXT}. Use the same suffix on every device that should keep a single edit history for this vault. Profiles are stored in the local plugin settings, they are not synchronized with the vault.`).addDropdown((dropdown) => {
-      var _a2;
-      activeProfileDropdown = dropdown;
-      for (const profile of historyProfiles) {
-        dropdown.addOption(profile.id, this.plugin.getHistoryProfileLabel(profile));
-      }
-      dropdown.setValue((_a2 = activeProfile == null ? void 0 : activeProfile.id) != null ? _a2 : "");
-      dropdown.selectEl.setAttribute("aria-label", "Profile used to read and write edit history files");
-      dropdown.onChange(async (value) => {
-        logInfo("Active history profile: " + value);
-        await this.plugin.setActiveHistoryProfile(value);
-        this.display();
-      });
-    }).addButton((button) => button.setButtonText("Add profile").onClick(async () => {
-      logInfo("Adding a history profile");
-      await this.plugin.addHistoryProfile();
-      this.display();
-    }));
-    for (const profile of historyProfiles) {
-      const profileEl = containerEl.createEl("details", { cls: "edit-history-profile" });
-      const isActiveProfile = profile.id == (activeProfile == null ? void 0 : activeProfile.id);
-      profileEl.open = isActiveProfile || this.expandedProfileIds.has(profile.id);
-      const summaryEl = profileEl.createEl("summary", { cls: "edit-history-profile-summary" });
-      const labelEl = summaryEl.createEl("span", {
-        cls: "edit-history-profile-label",
-        text: this.plugin.getHistoryProfileLabel(profile)
-      });
-      if (isActiveProfile) {
-        summaryEl.createEl("span", { cls: "edit-history-profile-active", text: "in use" });
-      }
-      profileEl.addEventListener("toggle", () => {
-        if (profileEl.open && !isActiveProfile) {
-          this.expandedProfileIds.add(profile.id);
-        } else {
-          this.expandedProfileIds.delete(profile.id);
-        }
-      });
-      const refreshLabels = () => {
-        const label = this.plugin.getHistoryProfileLabel(profile);
-        labelEl.setText(label);
-        setting.setName(label);
-        const options = activeProfileDropdown == null ? void 0 : activeProfileDropdown.selectEl.options;
-        if (options) {
-          for (let i = 0; i < options.length; i++) {
-            if (options[i].value == profile.id) {
-              options[i].text = label;
-            }
-          }
-        }
-      };
-      const setting = new import_obsidian.Setting(profileEl).setName(this.plugin.getHistoryProfileLabel(profile)).setDesc("Name is a local label shown in the edit history dialog, suffix is part of the history file name").addText((text) => text.setPlaceholder("Name").setValue(profile.name).onChange(async (value) => {
-        logInfo("History profile name: " + value);
-        await this.plugin.setHistoryProfileName(profile, value);
-        refreshLabels();
-      })).addText((text) => text.setPlaceholder("Suffix").setValue(profile.suffix).onChange(async (value) => {
-        if (!await this.plugin.setHistoryProfileSuffix(profile, value)) {
-          text.setValue(profile.suffix);
-        }
-        refreshLabels();
-      }));
-      if (historyProfiles.length > 1) {
-        setting.addExtraButton((button) => button.setIcon("trash").onClick(async () => {
-          logInfo("Removing history profile: " + profile.suffix);
-          await this.plugin.removeHistoryProfile(profile);
-          this.display();
-        }));
-        (_a = setting.controlEl.lastElementChild) == null ? void 0 : _a.setAttribute("aria-label", "Delete this profile, its edit history files are kept");
-      }
-    }
-    new import_obsidian.Setting(containerEl).setName("Merge old edit history files").setDesc("Merge the old edit history files of every note (legacy shared files and files of other profiles or devices) into the edit history file of the active profile").addButton((button) => button.setButtonText("Merge\u2026").onClick(() => {
-      new EditHistoryMergeModal(this.plugin).open();
-    }));
     containerEl.createEl("h3", { text: "General" });
     new import_obsidian.Setting(containerEl).setName("Minimum seconds between edits").setDesc("Minimum number of seconds that must pass from the previous edit to store a new edit, set to 0 to disable. Modifications done between those seconds will be merged into the next edit, reducing the edit history file size at the expense of less history granularity.").addText((text) => text.setPlaceholder(DEFAULT_SETTINGS.minSecondsBetweenEdits).setValue(this.plugin.settings.minSecondsBetweenEdits).onChange(async (value) => {
       logInfo("Minimum seconds between edits: " + value);
@@ -6265,6 +6185,70 @@ var EditHistorySettingTab = class extends import_obsidian.PluginSettingTab {
       logInfo("Show whitespace: " + value);
       this.plugin.settings.showWhitespace = value;
       await this.plugin.saveSettings();
+    }));
+    const historyProfiles = this.plugin.getHistoryProfiles();
+    const activeProfile = this.plugin.getActiveHistoryProfile();
+    const profilesEl = containerEl.createEl("details", { cls: "edit-history-profiles" });
+    profilesEl.open = this.historyProfilesExpanded;
+    profilesEl.addEventListener("toggle", () => {
+      this.historyProfilesExpanded = profilesEl.open;
+    });
+    const summaryEl = profilesEl.createEl("summary", { cls: "edit-history-profiles-header" });
+    let activeProfileDropdown = null;
+    const headerSetting = new import_obsidian.Setting(summaryEl).setName("History profiles").addDropdown((dropdown) => {
+      var _a2;
+      activeProfileDropdown = dropdown;
+      for (const profile of historyProfiles) {
+        dropdown.addOption(profile.id, this.plugin.getHistoryProfileLabel(profile));
+      }
+      dropdown.setValue((_a2 = activeProfile == null ? void 0 : activeProfile.id) != null ? _a2 : "");
+      dropdown.selectEl.setAttribute("aria-label", "Profile used to read and write edit history files");
+      dropdown.onChange(async (value) => {
+        logInfo("Active history profile: " + value);
+        await this.plugin.setActiveHistoryProfile(value);
+        this.display();
+      });
+    }).addButton((button) => button.setButtonText("Add profile").onClick(async () => {
+      logInfo("Adding a history profile");
+      await this.plugin.addHistoryProfile();
+      this.display();
+    }));
+    headerSetting.controlEl.addEventListener("click", (event) => event.stopPropagation());
+    profilesEl.createEl("div", { text: `A history profile selects the suffix of the edit history file name, a note Notes/a.md is stored as Notes/a.md${HISTORY_SUFFIX_MARKER}<suffix>${EDIT_HISTORY_FILE_EXT}. Use the same suffix on every device that should keep a single edit history for this vault. Profiles are stored in the local plugin settings, they are not synchronized with the vault.` });
+    for (const profile of historyProfiles) {
+      const refreshLabels = () => {
+        const label = this.plugin.getHistoryProfileLabel(profile);
+        setting.setName(label);
+        const options = activeProfileDropdown == null ? void 0 : activeProfileDropdown.selectEl.options;
+        if (options) {
+          for (let i = 0; i < options.length; i++) {
+            if (options[i].value == profile.id) {
+              options[i].text = label;
+            }
+          }
+        }
+      };
+      const setting = new import_obsidian.Setting(profilesEl).setName(this.plugin.getHistoryProfileLabel(profile)).setDesc("Name is a local label shown in the edit history dialog, suffix is part of the history file name").addText((text) => text.setPlaceholder("Name").setValue(profile.name).onChange(async (value) => {
+        logInfo("History profile name: " + value);
+        await this.plugin.setHistoryProfileName(profile, value);
+        refreshLabels();
+      })).addText((text) => text.setPlaceholder("Suffix").setValue(profile.suffix).onChange(async (value) => {
+        if (!await this.plugin.setHistoryProfileSuffix(profile, value)) {
+          text.setValue(profile.suffix);
+        }
+        refreshLabels();
+      }));
+      if (historyProfiles.length > 1) {
+        setting.addExtraButton((button) => button.setIcon("trash").onClick(async () => {
+          logInfo("Removing history profile: " + profile.suffix);
+          await this.plugin.removeHistoryProfile(profile);
+          this.display();
+        }));
+        (_a = setting.controlEl.lastElementChild) == null ? void 0 : _a.setAttribute("aria-label", "Delete this profile, its edit history files are kept");
+      }
+    }
+    new import_obsidian.Setting(containerEl).setName("Merge old edit history files").setDesc("Merge the old edit history files of every note (legacy shared files and files of other profiles or devices) into the edit history file of the active profile").addButton((button) => button.setButtonText("Merge\u2026").onClick(() => {
+      new EditHistoryMergeModal(this.plugin).open();
     }));
     containerEl.createEl("h3", { text: "Debugging" });
     new import_obsidian.Setting(containerEl).setName("Debug level").setDesc("Messages to show in the javascript console.").addDropdown((dropdown) => dropdown.addOption("error", "Errors").addOption("warn", "Warnings").addOption("info", "Information").addOption("debug", "Verbose").setValue(this.plugin.settings.debugLevel).onChange(async (value) => {

@@ -136,48 +136,30 @@
  * History profiles settings
  */
 
-/* Title bar of the history profiles section, it holds the profile selector and
-   the button to add a profile */
-.edit-history-profiles-header {
-    border-top: none;
-    padding-top: 0;
-}
-.edit-history-profiles-header .setting-item-name {
-    /* Match the h3 of the other settings sections, since h2 is abnormally
-       small in settings */
-    font-size: var(--h3-size, 1.17em);
-    font-weight: var(--h3-weight, 600);
-    line-height: var(--h3-line-height, 1.3);
-    color: var(--text-normal);
-}
-
-/* Every history profile is a collapsible panel */
-.edit-history-profile {
+/* The whole history profiles block is a single collapsible section */
+.edit-history-profiles {
     border: 1px solid var(--background-modifier-border);
     border-radius: var(--radius-m, 6px);
     padding: 0 var(--size-4-3, 12px);
     margin-bottom: var(--size-4-2, 8px);
 }
-.edit-history-profile > summary.edit-history-profile-summary {
+/* Title row of the block, it holds the profile selector and the button to add
+   a profile, so both stay reachable while the block is collapsed */
+.edit-history-profiles > summary.edit-history-profiles-header {
     cursor: pointer;
-    padding: var(--size-4-2, 8px) 0;
-    font-weight: var(--font-medium, 500);
     color: var(--text-normal);
 }
-.edit-history-profile > summary.edit-history-profile-summary:hover {
-    color: var(--text-accent);
-}
-/* Mark of the profile used to read and write the edit history files */
-.edit-history-profile .edit-history-profile-active {
-    margin-left: var(--size-4-2, 8px);
-    padding: 0 var(--size-4-2, 8px);
-    border-radius: var(--radius-s, 4px);
-    background-color: var(--background-modifier-hover);
-    color: var(--text-muted);
-    font-size: var(--font-ui-smaller, 0.8em);
-    font-weight: var(--font-normal, 400);
-}
-/* The setting rows are inside the panel, so the first one needs no separator */
-.edit-history-profile > .setting-item:first-of-type {
+.edit-history-profiles > summary.edit-history-profiles-header .setting-item {
     border-top: none;
+    padding: var(--size-4-2, 8px) 0;
+}
+.edit-history-profiles > summary.edit-history-profiles-header .setting-item-name {
+    /* Match the h3 of the other settings sections, since h2 is abnormally
+       small in settings */
+    font-size: var(--h3-size, 1.17em);
+    font-weight: var(--h3-weight, 600);
+    line-height: var(--h3-line-height, 1.3);
+}
+.edit-history-profiles > summary.edit-history-profiles-header:hover .setting-item-name {
+    color: var(--text-accent);
 }
