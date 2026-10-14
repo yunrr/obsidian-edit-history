@@ -65,11 +65,13 @@ This most recent version may not be the latest version of the note if a non-zero
 
 Each entry in the file is named after the UTC epoch in seconds at which time the edit was made, encoded as chars, and ending in "$" if the entry is stored in full, otherwise stored as a diff.
 
+When a second holds more than one version (two devices saving the same note in the same second, or a forced save right after another one), the extra versions are numbered after "~", e.g. `1f2a3b~1$`. The first version of a second keeps the plain name, so a history file without such collisions is still readable by older versions of the plugin.
+
 ### Merging old history files
 
 The merge command (and the corresponding settings button) scans the whole vault and merges, for every note, the versions of all its other history files (the legacy shared file and the files of other profiles or devices) into the active profile history file. Versions are combined by date and re-encoded, the note itself is not modified.
 
-Entries are identified by their second-precision timestamp, so when two files store a version for the same second the version of the active profile history file is kept and the other file is reported and kept instead of being removed. Old files that can be removed are kept, moved to the trash, or deleted permanently, depending on the choice in the merge dialog. Removing them is only done after the merged history file has been written.
+Entries are identified by their second-precision timestamp, so a second can hold several versions: when two files store a version for the same second both are kept, the versions of the active profile history file first and the ones of the other files appended after them. Merging the same files again adds nothing. Old files are kept, moved to the trash, or deleted permanently, depending on the choice in the merge dialog, and a file is only removed once all of its versions are in the active profile history file. Removing them is only done after the merged history file has been written, and files that cannot be read are always kept and reported in the merge notice.
 
 ## Versions
 

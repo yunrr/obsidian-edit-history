@@ -4451,7 +4451,8 @@ var EDIT_HISTORY_FILE_EXT = ".edtz";
 var HISTORY_SUFFIX_MARKER = ".eh-";
 var MAX_HISTORY_SUFFIX_LENGTH = 64;
 var INVALID_SUFFIX_CHARS = /[\\/:*?"<>|#^[\]]/;
-var HISTORY_ENTRY_NAME = /^[0-9a-z]+\$?$/;
+var HISTORY_ENTRY_NAME = /^[0-9a-z]+(~[1-9][0-9]*)?\$?$/;
+var HISTORY_SEQUENCE_MARKER = "~";
 function containsControlChar(value) {
   for (let i = 0; i < value.length; i++) {
     const code = value.charCodeAt(i);
@@ -4461,18 +4462,41 @@ function containsControlChar(value) {
   }
   return false;
 }
+function parseHistoryEntryName(entryName) {
+  const markerIndex = entryName.indexOf(HISTORY_SEQUENCE_MARKER);
+  if (markerIndex < 0) {
+    return { epochPart: entryName, sequence: 0 };
+  }
+  return {
+    epochPart: entryName.substring(0, markerIndex),
+    sequence: parseInt(entryName.substring(markerIndex + HISTORY_SEQUENCE_MARKER.length), 10)
+  };
+}
 function historyEntryEpoch(entryName) {
-  return parseInt(entryName, 36) * 1e3;
+  return parseInt(parseHistoryEntryName(entryName).epochPart, 36) * 1e3;
+}
+function historyEntrySequence(entryName) {
+  return parseHistoryEntryName(entryName).sequence;
 }
 function historyEntryIsDiff(entryName) {
   return !entryName.endsWith("$");
 }
-function buildHistoryEntryName(mtime, isDiff) {
+function buildHistoryEntryName(mtime, isDiff, sequence = 0) {
   const utcepoch = Math.floor(mtime / 1e3);
-  return utcepoch.toString(36) + (isDiff ? "" : "$");
+  const sequenceSuffix = sequence > 0 ? HISTORY_SEQUENCE_MARKER + sequence : "";
+  return utcepoch.toString(36) + sequenceSuffix + (isDiff ? "" : "$");
+}
+function allocateHistoryEntryName(mtime, isDiff, usedEntryNames) {
+  for (let sequence = 0; ; sequence++) {
+    const name = buildHistoryEntryName(mtime, isDiff, sequence);
+    const otherName = buildHistoryEntryName(mtime, !isDiff, sequence);
+    if (!usedEntryNames.has(name) && !usedEntryNames.has(otherName)) {
+      return name;
+    }
+  }
 }
 function sortHistoryEntriesDescending(entryNames) {
-  entryNames.sort((a, b) => historyEntryEpoch(b) - historyEntryEpoch(a));
+  entryNames.sort((a, b) => historyEntryEpoch(b) - historyEntryEpoch(a) || historyEntrySequence(b) - historyEntrySequence(a));
 }
 function normalizeHistorySuffix(suffix) {
   if (typeof suffix !== "string") {
@@ -4543,25 +4567,51 @@ async function readHistoryVersions(zip, patchEngine) {
       versionContent = entryData;
     }
     content = versionContent;
-    versions.push({ epoch: historyEntryEpoch(entryName), content: versionContent });
+    versions.push({
+      epoch: historyEntryEpoch(entryName),
+      sequence: historyEntrySequence(entryName),
+      content: versionContent
+    });
   }
   return { versions, error: null };
 }
 function mergeHistoryVersionLists(versionLists) {
-  const byEpoch = /* @__PURE__ */ new Map();
-  let duplicateEpochs = 0;
+  const contentsByEpoch = /* @__PURE__ */ new Map();
+  let duplicateVersions = 0;
   for (const versionList of versionLists) {
+    const versionsByEpoch = /* @__PURE__ */ new Map();
     for (const version of versionList) {
-      if (byEpoch.has(version.epoch)) {
-        duplicateEpochs++;
-        continue;
+      const versions2 = versionsByEpoch.get(version.epoch);
+      if (versions2 == null) {
+        versionsByEpoch.set(version.epoch, [version]);
+      } else {
+        versions2.push(version);
       }
-      byEpoch.set(version.epoch, version);
+    }
+    for (const [epoch, versions2] of versionsByEpoch) {
+      versions2.sort((a, b) => (a.sequence || 0) - (b.sequence || 0));
+      let contents = contentsByEpoch.get(epoch);
+      if (contents == null) {
+        contents = [];
+        contentsByEpoch.set(epoch, contents);
+      }
+      for (const version of versions2) {
+        if (contents.includes(version.content)) {
+          duplicateVersions++;
+          continue;
+        }
+        contents.push(version.content);
+      }
     }
   }
-  const versions = Array.from(byEpoch.values());
-  versions.sort((a, b) => a.epoch - b.epoch);
-  return { versions, duplicateEpochs };
+  const versions = [];
+  for (const [epoch, contents] of contentsByEpoch) {
+    for (const [sequence, content] of contents.entries()) {
+      versions.push({ epoch, sequence, content });
+    }
+  }
+  versions.sort((a, b) => a.epoch - b.epoch || a.sequence - b.sequence);
+  return { versions, duplicateVersions };
 }
 async function buildMergedHistoryZip(versions, patchEngine) {
   const zip = new import_jszip.default();
@@ -4569,13 +4619,22 @@ async function buildMergedHistoryZip(versions, patchEngine) {
   let skippedDuplicateContent = 0;
   let newerContent = null;
   const orderedVersions = [];
-  const seenEpochs = /* @__PURE__ */ new Set();
-  for (const version of [...versions].sort((a, b) => a.epoch - b.epoch)) {
-    if (seenEpochs.has(version.epoch)) {
+  const contentsByEpoch = /* @__PURE__ */ new Map();
+  for (const version of [...versions].sort((a, b) => a.epoch - b.epoch || (a.sequence || 0) - (b.sequence || 0))) {
+    let contents = contentsByEpoch.get(version.epoch);
+    if (contents == null) {
+      contents = [];
+      contentsByEpoch.set(version.epoch, contents);
+    }
+    if (contents.includes(version.content)) {
       continue;
     }
-    seenEpochs.add(version.epoch);
-    orderedVersions.push(version);
+    contents.push(version.content);
+    orderedVersions.push({
+      epoch: version.epoch,
+      sequence: contents.length - 1,
+      content: version.content
+    });
   }
   for (let i = orderedVersions.length - 1; i >= 0; --i) {
     const version = orderedVersions[i];
@@ -4585,14 +4644,14 @@ async function buildMergedHistoryZip(versions, patchEngine) {
     }
     const date = new Date(version.epoch - new Date(version.epoch).getTimezoneOffset() * 6e4);
     if (newerContent == null) {
-      zip.file(buildHistoryEntryName(version.epoch, false), version.content, { date, compression: "DEFLATE" });
+      zip.file(buildHistoryEntryName(version.epoch, false, version.sequence), version.content, { date, compression: "DEFLATE" });
       fullEntryCount++;
     } else {
       const patch = patchEngine.patch_toText(patchEngine.patch_make(newerContent, version.content));
       if (patch.length < version.content.length) {
-        zip.file(buildHistoryEntryName(version.epoch, true), patch, { date, compression: "DEFLATE" });
+        zip.file(buildHistoryEntryName(version.epoch, true, version.sequence), patch, { date, compression: "DEFLATE" });
       } else {
-        zip.file(buildHistoryEntryName(version.epoch, false), version.content, { date, compression: "DEFLATE" });
+        zip.file(buildHistoryEntryName(version.epoch, false, version.sequence), version.content, { date, compression: "DEFLATE" });
         fullEntryCount++;
       }
     }
@@ -5045,50 +5104,32 @@ var EditHistory = class extends import_obsidian.Plugin {
    */
   async mergeHistoryGroup(group, patchEngine) {
     const targetVersions = [];
-    const targetEpochs = /* @__PURE__ */ new Set();
     if (group.target != null) {
       const targetResult = await this.readHistoryVersionsFromFile(group.target, patchEngine);
       if (targetResult.error != null) {
         throw new Error("can't read " + group.target.path + ": " + targetResult.error);
       }
-      for (const version of targetResult.versions) {
-        targetEpochs.add(version.epoch);
-      }
       targetVersions.push(...targetResult.versions);
     }
+    const targetContents = new Set(targetVersions.map((version) => this.versionIdentity(version)));
     const versionLists = [targetVersions];
-    const epochContents = new Map(targetVersions.map((version) => [version.epoch, version.content]));
     const mergedSources = [];
-    const conflictingSources = [];
-    let unreadableSources = 0;
+    const unreadableSources = [];
     for (const source of group.sources) {
       const sourceResult = await this.readHistoryVersionsFromFile(source, patchEngine);
       if (sourceResult.error != null) {
         logError("Can't merge edit history file", source.path, sourceResult.error);
-        unreadableSources++;
+        unreadableSources.push(source);
         continue;
       }
-      let conflicting = false;
-      for (const version of sourceResult.versions) {
-        const existingContent = epochContents.get(version.epoch);
-        if (existingContent == null) {
-          epochContents.set(version.epoch, version.content);
-        } else if (existingContent != version.content) {
-          conflicting = true;
-        }
-      }
       versionLists.push(sourceResult.versions);
-      if (conflicting) {
-        logWarn("Keeping edit history file with a conflicting version", source.path);
-        conflictingSources.push(source);
-      } else {
-        mergedSources.push(source);
-      }
+      mergedSources.push(source);
     }
     const merged = mergeHistoryVersionLists(versionLists);
-    const addedVersions = merged.versions.filter((version) => !targetEpochs.has(version.epoch)).length;
+    const addedVersions = merged.versions.filter((version) => !targetContents.has(this.versionIdentity(version)));
+    const addedSameSecondVersions = addedVersions.filter((version) => version.sequence > 0).length;
     let skippedDuplicateContent = 0;
-    if (addedVersions > 0) {
+    if (addedVersions.length > 0) {
       const mergedHistory = await buildMergedHistoryZip(merged.versions, patchEngine);
       skippedDuplicateContent = mergedHistory.skippedDuplicateContent;
       const newZipData = await mergedHistory.zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
@@ -5109,18 +5150,28 @@ var EditHistory = class extends import_obsidian.Plugin {
         "edit history file(s) into",
         group.targetPath,
         "with",
-        addedVersions,
-        "new version(s)"
+        addedVersions.length,
+        "new version(s),",
+        addedSameSecondVersions,
+        "of them sharing a second with a version already stored"
       );
     }
     return {
       notePath: group.notePath,
       mergedSources,
-      conflictingSources,
-      addedVersions,
-      skippedDuplicateContent,
-      unreadableSources
+      unreadableSources,
+      addedVersions: addedVersions.length,
+      addedSameSecondVersions,
+      skippedDuplicateContent
     };
+  }
+  /**
+   * What makes a version of a note the same version as another one: the second
+   * it was stored for and its contents. The sequence is deliberately not part
+   * of it, so merging the same sources twice adds nothing the second time
+   */
+  versionIdentity(version) {
+    return version.epoch + "\n" + version.content;
   }
   /**
    * @return the number of history files that were removed
@@ -5153,9 +5204,10 @@ var EditHistory = class extends import_obsidian.Plugin {
         groups: 0,
         mergedNotes: 0,
         addedVersions: 0,
+        addedSameSecondVersions: 0,
         alreadyMergedNotes: 0,
         clearedFiles: 0,
-        keptConflictingFiles: 0,
+        keptFiles: [],
         skippedDuplicateVersions: 0,
         unreadableFiles: 0,
         errors: 0
@@ -5166,9 +5218,10 @@ var EditHistory = class extends import_obsidian.Plugin {
       groups: groups.length,
       mergedNotes: 0,
       addedVersions: 0,
+      addedSameSecondVersions: 0,
       alreadyMergedNotes: 0,
       clearedFiles: 0,
-      keptConflictingFiles: 0,
+      keptFiles: [],
       skippedDuplicateVersions: 0,
       unreadableFiles: 0,
       errors: 0
@@ -5185,16 +5238,18 @@ var EditHistory = class extends import_obsidian.Plugin {
           if (groupResult.addedVersions > 0) {
             result.mergedNotes++;
             result.addedVersions += groupResult.addedVersions;
+            result.addedSameSecondVersions += groupResult.addedSameSecondVersions;
           } else {
             result.alreadyMergedNotes++;
           }
-          result.keptConflictingFiles += groupResult.conflictingSources.length;
-          result.unreadableFiles += groupResult.unreadableSources;
+          result.unreadableFiles += groupResult.unreadableSources.length;
+          result.keptFiles.push(...groupResult.unreadableSources.map((source) => source.path));
           result.skippedDuplicateVersions += groupResult.skippedDuplicateContent;
           result.clearedFiles += await this.cleanMergedHistorySources(groupResult.mergedSources, cleanupMode);
         } catch (error) {
           result.errors++;
           logError("Can't merge the edit history files of", group.notePath, error);
+          result.keptFiles.push(...group.sources.map((source) => source.path));
         }
       }
     } finally {
@@ -5202,11 +5257,43 @@ var EditHistory = class extends import_obsidian.Plugin {
       progressNotice.hide();
     }
     logInfo("Merged edit histories", JSON.stringify(result));
-    new import_obsidian.Notice(
-      `Merged edit histories: ${result.mergedNotes} note(s) and ${result.addedVersions} version(s) merged, ${result.alreadyMergedNotes} already up to date, ${result.clearedFiles} old file(s) removed, ${result.keptConflictingFiles} file(s) kept with conflicting versions, ${result.skippedDuplicateVersions} version(s) skipped as unchanged, ${result.unreadableFiles} unreadable, ${result.errors} error(s)`,
-      15e3
+    if (result.keptFiles.length > 0) {
+      logWarn(
+        "Kept",
+        result.keptFiles.length,
+        "edit history file(s) that could not be merged:",
+        result.keptFiles.join(", ")
+      );
+    }
+    const noticeParts = [
+      `${result.mergedNotes} note(s) and ${result.addedVersions} version(s) merged`
+    ];
+    if (result.addedSameSecondVersions > 0) {
+      noticeParts.push(`${result.addedSameSecondVersions} of them sharing a second with a version already stored`);
+    }
+    noticeParts.push(
+      `${result.alreadyMergedNotes} already up to date`,
+      `${result.clearedFiles} old file(s) removed`
     );
+    if (result.keptFiles.length > 0) {
+      noticeParts.push(`${result.keptFiles.length} file(s) kept: ` + this.summarizePaths(result.keptFiles));
+    }
+    noticeParts.push(
+      `${result.skippedDuplicateVersions} version(s) skipped as unchanged`,
+      `${result.errors} error(s)`
+    );
+    new import_obsidian.Notice("Merged edit histories: " + noticeParts.join(", "), 15e3);
     return result;
+  }
+  /**
+   * @return the paths, shortened to fit in a notice (the log has them all)
+   */
+  summarizePaths(paths) {
+    const maxPaths = 3;
+    if (paths.length <= maxPaths) {
+      return paths.join(", ");
+    }
+    return paths.slice(0, maxPaths).join(", ") + " and " + (paths.length - maxPaths) + " more (see the log)";
   }
   async renameEditHistoryFile(oldPath, newPath, pathBuilder) {
     const oldHistoryFilepath = pathBuilder(oldPath);
@@ -5252,15 +5339,41 @@ var EditHistory = class extends import_obsidian.Plugin {
   getEditIsDiff(editFilename) {
     return historyEntryIsDiff(editFilename);
   }
-  buildEditFilename(mtime, isDiff) {
-    return buildHistoryEntryName(mtime, isDiff);
+  /**
+   * 0 for the first version stored for that second, n for the n-th extra
+   * version of that second
+   */
+  getEditSequence(editFilename) {
+    return historyEntrySequence(editFilename);
+  }
+  buildEditFilename(mtime, isDiff, sequence = 0) {
+    return buildHistoryEntryName(mtime, isDiff, sequence);
   }
   /**
-   * Sort in place
+   * @return the name to store a new version of a second that may already hold
+   *         versions, so a forced save in the same second is kept instead of
+   *         overwriting the version already stored for that second
+   */
+  buildNewEditFilename(mtime, usedEditFilenames) {
+    return allocateHistoryEntryName(mtime, false, new Set(usedEditFilenames));
+  }
+  /**
+   * @return the date of the version, with the same-second sequence appended
+   *         when the second holds more than one version, so the entries can be
+   *         told apart in the history list
+   */
+  getEditListLabel(editFilename) {
+    const sequence = this.getEditSequence(editFilename);
+    const label = this.getEditLocalDateStr(editFilename);
+    return sequence > 0 ? label + " (" + (sequence + 1) + ")" : label;
+  }
+  /**
+   * Sort in place. Versions of the same second are ordered by their sequence,
+   * the extra ones being newer
    */
   sortEdits(filenames, descending = true) {
     const i = descending ? 1 : -1;
-    filenames.sort((a, b) => i * (this.getEditEpoch(b) - this.getEditEpoch(a)));
+    filenames.sort((a, b) => i * (this.getEditEpoch(b) - this.getEditEpoch(a) || this.getEditSequence(b) - this.getEditSequence(a)));
   }
   commaSeparatedToList(s) {
     let list = [];
@@ -5397,13 +5510,10 @@ var EditHistory = class extends import_obsidian.Plugin {
           zip.remove(filepath);
         }
         numEdits = filepaths.length;
+        newFilename = this.buildNewEditFilename(file.stat.mtime, filepaths);
         if (filepaths.length > 0) {
           let mostRecentFilename = filepaths[0];
           let mostRecentFile = zip.file(mostRecentFilename);
-          if (this.getEditEpoch(mostRecentFilename) == this.getEditEpoch(newFilename)) {
-            logInfo("Delaying entry due to colliding epochs");
-            return;
-          }
           logInfo("unpacking " + mostRecentFilename);
           let prevFileData = await mostRecentFile.async("string");
           let diffs = dmpobj.patch_make(fileData, prevFileData.toString());
@@ -5414,7 +5524,8 @@ var EditHistory = class extends import_obsidian.Plugin {
               zip.remove(mostRecentFilename);
               mostRecentFilename = this.buildEditFilename(
                 this.getEditEpoch(mostRecentFilename),
-                true
+                true,
+                this.getEditSequence(mostRecentFilename)
               );
               logInfo(
                 "Storing ",
@@ -6053,7 +6164,7 @@ var EditHistoryModal = class extends import_obsidian.Modal {
       });
     });
     for (let filepath of filepaths) {
-      select.addOption(filepath, this.plugin.getEditLocalDateStr(filepath));
+      select.addOption(filepath, this.plugin.getEditListLabel(filepath));
     }
     select.selectEl.trigger("change");
     this.plugin.statusBarItemEl.setText(filepaths.length + " edits");
@@ -6075,7 +6186,7 @@ var EditHistoryMergeModal = class extends import_obsidian.Modal {
     this.titleEl.setText("Merge old edit histories");
     const { contentEl } = this;
     contentEl.addClass("edit-history-merge-modal-content");
-    contentEl.createEl("p", { text: "Merge the old edit history files of every note in this vault (legacy shared files and files of other history profiles or devices) into the edit history file of the active history profile. Merged versions are combined by date, the contents of the note are not modified." });
+    contentEl.createEl("p", { text: "Merge the old edit history files of every note in this vault (legacy shared files and files of other history profiles or devices) into the edit history file of the active history profile. Merged versions are combined by date, versions stored for the same second are all kept, and the contents of the note are not modified." });
     const summaryEl = contentEl.createEl("p", { text: "Scanning the vault\u2026" });
     const scanResult = this.plugin.collectHistoryMergeGroups();
     this.groups = scanResult.groups;
@@ -6091,7 +6202,7 @@ var EditHistoryMergeModal = class extends import_obsidian.Modal {
       }
       summaryEl.setText(summary);
     }
-    new import_obsidian.Setting(contentEl).setName("Old history files").setDesc("What to do with the old history files after their versions have been merged. Files holding a version that differs from the version kept for the same second are always kept.").addDropdown((dropdown) => dropdown.addOption("trash", "Move them to the trash (default)").addOption("delete", "Delete them permanently").addOption("keep", "Keep them").setValue(this.cleanupMode).onChange((value) => {
+    new import_obsidian.Setting(contentEl).setName("Old history files").setDesc("What to do with the old history files after their versions have been merged. Files that cannot be read are always kept.").addDropdown((dropdown) => dropdown.addOption("trash", "Move them to the trash (default)").addOption("delete", "Delete them permanently").addOption("keep", "Keep them").setValue(this.cleanupMode).onChange((value) => {
       logInfo("Merged history file cleanup: " + value);
       this.cleanupMode = value;
     }));

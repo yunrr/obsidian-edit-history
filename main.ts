@@ -34,6 +34,7 @@ const enum DiffOp {
 // this is the recommended way
 import JSZip from "jszip";
 import {
+    allocateHistoryEntryName,
     buildHistoryEntryName,
     buildMergedHistoryZip,
     deriveHistoryNotePathCandidates,
@@ -43,6 +44,7 @@ import {
     HistoryVersion,
     historyEntryEpoch,
     historyEntryIsDiff,
+    historyEntrySequence,
     mergeHistoryVersionLists,
     normalizeHistorySuffix,
     PatchEngine,
@@ -201,22 +203,26 @@ interface HistoryMergeGroupResult {
     notePath: string;
     // Old history files whose versions were merged and can be removed
     mergedSources: TFile[];
-    // Old history files kept because they have a version that differs from the
-    // version kept for the same second
-    conflictingSources: TFile[];
+    // Old history files kept because they could not be read
+    unreadableSources: TFile[];
     addedVersions: number;
+    // Versions added for a second that already held a version, stored under the
+    // next sequence of that second
+    addedSameSecondVersions: number;
     // Versions whose contents match the next newer kept version, not stored
     skippedDuplicateContent: number;
-    unreadableSources: number;
 }
 
 interface HistoryMergeResult {
     groups: number;
     mergedNotes: number;
     addedVersions: number;
+    addedSameSecondVersions: number;
     alreadyMergedNotes: number;
     clearedFiles: number;
-    keptConflictingFiles: number;
+    // Paths of the old history files left in place because they could not be
+    // read or because their note failed to merge
+    keptFiles: string[];
     skippedDuplicateVersions: number;
     unreadableFiles: number;
     errors: number;
@@ -713,58 +719,43 @@ export default class EditHistory extends Plugin {
      */
     async mergeHistoryGroup(group: HistoryMergeGroup, patchEngine: PatchEngine): Promise<HistoryMergeGroupResult> {
         const targetVersions: HistoryVersion[] = [];
-        const targetEpochs = new Set<number>();
         if (group.target != null) {
             const targetResult = await this.readHistoryVersionsFromFile(group.target, patchEngine);
             if (targetResult.error != null) {
                 throw new Error("can't read " + group.target.path + ": " + targetResult.error);
             }
-            for (const version of targetResult.versions) {
-                targetEpochs.add(version.epoch);
-            }
             targetVersions.push(...targetResult.versions);
         }
 
+        // A version is already in the target when the target holds one with the
+        // same contents for that second; a version of a second with different
+        // contents is added as an extra version of that second
+        const targetContents = new Set<string>(targetVersions.map(version => this.versionIdentity(version)));
         const versionLists: HistoryVersion[][] = [targetVersions];
-        const epochContents = new Map<number, string>(targetVersions.map(version => [version.epoch, version.content]));
         const mergedSources: TFile[] = [];
-        const conflictingSources: TFile[] = [];
-        let unreadableSources = 0;
+        const unreadableSources: TFile[] = [];
 
         for (const source of group.sources) {
             const sourceResult = await this.readHistoryVersionsFromFile(source, patchEngine);
             if (sourceResult.error != null) {
                 logError("Can't merge edit history file", source.path, sourceResult.error);
-                unreadableSources++;
+                unreadableSources.push(source);
                 continue;
             }
 
-            // A source whose version differs from the version already kept for
-            // the same second keeps its file, so nothing is silently lost
-            let conflicting = false;
-            for (const version of sourceResult.versions) {
-                const existingContent = epochContents.get(version.epoch);
-                if (existingContent == null) {
-                    epochContents.set(version.epoch, version.content);
-                } else if (existingContent != version.content) {
-                    conflicting = true;
-                }
-            }
-
             versionLists.push(sourceResult.versions);
-            if (conflicting) {
-                logWarn("Keeping edit history file with a conflicting version", source.path);
-                conflictingSources.push(source);
-            } else {
-                mergedSources.push(source);
-            }
+            mergedSources.push(source);
         }
 
         const merged = mergeHistoryVersionLists(versionLists);
-        const addedVersions = merged.versions.filter(version => !targetEpochs.has(version.epoch)).length;
+
+        // Count what the merge adds to the target, so a version held by several
+        // sources is counted once and the sequences are the ones stored
+        const addedVersions = merged.versions.filter(version => !targetContents.has(this.versionIdentity(version)));
+        const addedSameSecondVersions = addedVersions.filter(version => version.sequence > 0).length;
 
         let skippedDuplicateContent = 0;
-        if (addedVersions > 0) {
+        if (addedVersions.length > 0) {
             const mergedHistory = await buildMergedHistoryZip(merged.versions, patchEngine);
             skippedDuplicateContent = mergedHistory.skippedDuplicateContent;
             const newZipData = await mergedHistory.zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" });
@@ -781,17 +772,27 @@ export default class EditHistory extends Plugin {
                 await this.app.vault.modifyBinary(group.target, newZipData);
             }
             logInfo("Merged", mergedSources.length, "edit history file(s) into", group.targetPath,
-                "with", addedVersions, "new version(s)");
+                "with", addedVersions.length, "new version(s),",
+                addedSameSecondVersions, "of them sharing a second with a version already stored");
         }
 
         return {
             notePath: group.notePath,
             mergedSources: mergedSources,
-            conflictingSources: conflictingSources,
-            addedVersions: addedVersions,
-            skippedDuplicateContent: skippedDuplicateContent,
             unreadableSources: unreadableSources,
+            addedVersions: addedVersions.length,
+            addedSameSecondVersions: addedSameSecondVersions,
+            skippedDuplicateContent: skippedDuplicateContent,
         };
+    }
+
+    /**
+     * What makes a version of a note the same version as another one: the second
+     * it was stored for and its contents. The sequence is deliberately not part
+     * of it, so merging the same sources twice adds nothing the second time
+     */
+    versionIdentity(version: HistoryVersion): string {
+        return version.epoch + "\n" + version.content;
     }
 
     /**
@@ -823,9 +824,9 @@ export default class EditHistory extends Plugin {
             logWarn("Ignoring edit history merge, another merge is already running");
             new Notice("An edit history merge is already running", 5000);
             return {
-                groups: 0, mergedNotes: 0, addedVersions: 0, alreadyMergedNotes: 0,
-                clearedFiles: 0, keptConflictingFiles: 0, skippedDuplicateVersions: 0,
-                unreadableFiles: 0, errors: 0,
+                groups: 0, mergedNotes: 0, addedVersions: 0, addedSameSecondVersions: 0,
+                alreadyMergedNotes: 0, clearedFiles: 0, keptFiles: [],
+                skippedDuplicateVersions: 0, unreadableFiles: 0, errors: 0,
             };
         }
 
@@ -834,9 +835,10 @@ export default class EditHistory extends Plugin {
             groups: groups.length,
             mergedNotes: 0,
             addedVersions: 0,
+            addedSameSecondVersions: 0,
             alreadyMergedNotes: 0,
             clearedFiles: 0,
-            keptConflictingFiles: 0,
+            keptFiles: [],
             skippedDuplicateVersions: 0,
             unreadableFiles: 0,
             errors: 0,
@@ -855,16 +857,19 @@ export default class EditHistory extends Plugin {
                     if (groupResult.addedVersions > 0) {
                         result.mergedNotes++;
                         result.addedVersions += groupResult.addedVersions;
+                        result.addedSameSecondVersions += groupResult.addedSameSecondVersions;
                     } else {
                         result.alreadyMergedNotes++;
                     }
-                    result.keptConflictingFiles += groupResult.conflictingSources.length;
-                    result.unreadableFiles += groupResult.unreadableSources;
+                    result.unreadableFiles += groupResult.unreadableSources.length;
+                    result.keptFiles.push(...groupResult.unreadableSources.map(source => source.path));
                     result.skippedDuplicateVersions += groupResult.skippedDuplicateContent;
                     result.clearedFiles += await this.cleanMergedHistorySources(groupResult.mergedSources, cleanupMode);
                 } catch (error) {
                     result.errors++;
                     logError("Can't merge the edit history files of", group.notePath, error);
+                    // Nothing was merged for this note, so its old files stay
+                    result.keptFiles.push(...group.sources.map(source => source.path));
                 }
             }
         } finally {
@@ -873,14 +878,40 @@ export default class EditHistory extends Plugin {
         }
 
         logInfo("Merged edit histories", JSON.stringify(result));
-        new Notice(
-            `Merged edit histories: ${result.mergedNotes} note(s) and ${result.addedVersions} version(s) merged, ` +
-            `${result.alreadyMergedNotes} already up to date, ${result.clearedFiles} old file(s) removed, ` +
-            `${result.keptConflictingFiles} file(s) kept with conflicting versions, ` +
-            `${result.skippedDuplicateVersions} version(s) skipped as unchanged, ` +
-            `${result.unreadableFiles} unreadable, ${result.errors} error(s)`, 15000);
+        if (result.keptFiles.length > 0) {
+            logWarn("Kept", result.keptFiles.length, "edit history file(s) that could not be merged:",
+                result.keptFiles.join(", "));
+        }
+
+        const noticeParts = [
+            `${result.mergedNotes} note(s) and ${result.addedVersions} version(s) merged`,
+        ];
+        if (result.addedSameSecondVersions > 0) {
+            noticeParts.push(`${result.addedSameSecondVersions} of them sharing a second with a version already stored`);
+        }
+        noticeParts.push(
+            `${result.alreadyMergedNotes} already up to date`,
+            `${result.clearedFiles} old file(s) removed`);
+        if (result.keptFiles.length > 0) {
+            noticeParts.push(`${result.keptFiles.length} file(s) kept: ` + this.summarizePaths(result.keptFiles));
+        }
+        noticeParts.push(
+            `${result.skippedDuplicateVersions} version(s) skipped as unchanged`,
+            `${result.errors} error(s)`);
+        new Notice("Merged edit histories: " + noticeParts.join(", "), 15000);
 
         return result;
+    }
+
+    /**
+     * @return the paths, shortened to fit in a notice (the log has them all)
+     */
+    summarizePaths(paths: string[]): string {
+        const maxPaths = 3;
+        if (paths.length <= maxPaths) {
+            return paths.join(", ");
+        }
+        return paths.slice(0, maxPaths).join(", ") + " and " + (paths.length - maxPaths) + " more (see the log)";
     }
 
     async renameEditHistoryFile(oldPath: string, newPath: string, pathBuilder: (filepath: string) => string): Promise<void> {
@@ -939,13 +970,42 @@ export default class EditHistory extends Plugin {
     getEditIsDiff(editFilename: string): boolean {
         return historyEntryIsDiff(editFilename);
     }
+
+    /**
+     * 0 for the first version stored for that second, n for the n-th extra
+     * version of that second
+     */
+    getEditSequence(editFilename: string): number {
+        return historyEntrySequence(editFilename);
+    }
     
-    buildEditFilename(mtime: number, isDiff: boolean): string {
-        return buildHistoryEntryName(mtime, isDiff);
+    buildEditFilename(mtime: number, isDiff: boolean, sequence = 0): string {
+        return buildHistoryEntryName(mtime, isDiff, sequence);
     }
 
     /**
-     * Sort in place
+     * @return the name to store a new version of a second that may already hold
+     *         versions, so a forced save in the same second is kept instead of
+     *         overwriting the version already stored for that second
+     */
+    buildNewEditFilename(mtime: number, usedEditFilenames: string[]): string {
+        return allocateHistoryEntryName(mtime, false, new Set(usedEditFilenames));
+    }
+
+    /**
+     * @return the date of the version, with the same-second sequence appended
+     *         when the second holds more than one version, so the entries can be
+     *         told apart in the history list
+     */
+    getEditListLabel(editFilename: string): string {
+        const sequence = this.getEditSequence(editFilename);
+        const label = this.getEditLocalDateStr(editFilename);
+        return (sequence > 0) ? (label + " (" + (sequence + 1) + ")") : label;
+    }
+
+    /**
+     * Sort in place. Versions of the same second are ordered by their sequence,
+     * the extra ones being newer
      */
     sortEdits(filenames: string[], descending: boolean = true) {
         const i = descending ? 1 : -1; 
@@ -954,7 +1014,8 @@ export default class EditHistory extends Plugin {
         // to epoch before sorting
         // XXX Could do .length plus < checks, though, removing trailing $ when
         //     necessary)
-        filenames.sort((a,b) => i * (this.getEditEpoch(b) - this.getEditEpoch(a)));
+        filenames.sort((a,b) => i * ((this.getEditEpoch(b) - this.getEditEpoch(a)) ||
+            (this.getEditSequence(b) - this.getEditSequence(a))));
     }
 
     commaSeparatedToList(s: string) {
@@ -1225,6 +1286,12 @@ export default class EditHistory extends Plugin {
                     zip.remove(filepath);
                 }
                 numEdits = filepaths.length;
+
+                // The incoming version can land in a second that already holds
+                // versions (a forced save can happen at any time), so allocate
+                // the next free sequence of that second instead of overwriting
+                // the version already stored for it
+                newFilename = this.buildNewEditFilename(file.stat.mtime, filepaths);
                 
                 if (filepaths.length > 0) {
                     // Diff the latest stored edit against the incoming file
@@ -1245,18 +1312,11 @@ export default class EditHistory extends Plugin {
                     let mostRecentFilename = filepaths[0];
                     let mostRecentFile = zip.file(mostRecentFilename);
 
-                    if (this.getEditEpoch(mostRecentFilename) == this.getEditEpoch(newFilename)) {
-                        // Don't allow changes done at the same epoch since it
-                        // will get the same filename and overwrite the previous
-                        // version, corrupting the history. With the current
-                        // epoch granularity this essentially means that changes
-                        // have to be at least one second apart, which is almost
-                        // always the case unless there's a forced save.
-                        // XXX This could just remove the last change and update
-                        //     to this one?
-                        logInfo("Delaying entry due to colliding epochs");
-                        return;
-                    }
+                    // Note the incoming version got a name of its own above, so
+                    // storing a version for the same second as the newest stored
+                    // one appends a newer version to that second instead of
+                    // overwriting it (the newest version of a second has the
+                    // highest sequence)
                     
                     logInfo("unpacking " + mostRecentFilename);
                     let prevFileData = await mostRecentFile.async("string");
@@ -1281,10 +1341,12 @@ export default class EditHistory extends Plugin {
                             // newest version
                             logInfo("Removing ", mostRecentFilename);
                             zip.remove(mostRecentFilename);
-                            // Store as a diff
+                            // Store as a diff, keeping the sequence of the second
+                            // the version belongs to
                             mostRecentFilename = this.buildEditFilename(
                                 this.getEditEpoch(mostRecentFilename), 
-                                true
+                                true,
+                                this.getEditSequence(mostRecentFilename)
                             );
                             logInfo("Storing ", mostRecentFilename, " with date ", 
                                 mostRecentFile.date, " timestamp ", mostRecentFile.extendedTimestamp);
@@ -2366,7 +2428,7 @@ class EditHistoryModal extends Modal {
             //      - the last entry is a diff from that entry's date to the 
             //        empty file
             //     Missing setting the first dummy entry
-            select.addOption(filepath, this.plugin.getEditLocalDateStr(filepath));
+            select.addOption(filepath, this.plugin.getEditListLabel(filepath));
         }
         // Force initialization done inside onChange
         select.selectEl.trigger("change");
@@ -2402,7 +2464,8 @@ class EditHistoryMergeModal extends Modal {
 
         contentEl.createEl("p", { text:
             "Merge the old edit history files of every note in this vault (legacy shared files and files of other history profiles or devices) " +
-            "into the edit history file of the active history profile. Merged versions are combined by date, the contents of the note are not modified." });
+            "into the edit history file of the active history profile. Merged versions are combined by date, versions stored for the same " +
+            "second are all kept, and the contents of the note are not modified." });
 
         const summaryEl = contentEl.createEl("p", { text: "Scanning the vault…" });
 
@@ -2426,7 +2489,7 @@ class EditHistoryMergeModal extends Modal {
         new Setting(contentEl)
             .setName("Old history files")
             .setDesc("What to do with the old history files after their versions have been merged. " +
-                "Files holding a version that differs from the version kept for the same second are always kept.")
+                "Files that cannot be read are always kept.")
             .addDropdown(dropdown => dropdown
                 .addOption("trash", "Move them to the trash (default)")
                 .addOption("delete", "Delete them permanently")

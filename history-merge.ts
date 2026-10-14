@@ -7,6 +7,10 @@
 //  - One zip entry per stored version
 //  - The entry name is the UTC epoch in seconds (base-36), suffixed with "$"
 //    when the version is stored in full
+//  - A second holding more than one version numbers the extra ones after "~"
+//    (eg "1f2a3b~1$"), since the name only carries second precision. The first
+//    version of a second keeps the plain name, so a history file without
+//    collisions keeps the names older plugin versions understand
 //  - The newest version is always stored in full, older versions are stored as
 //    backwards diff-match-patch patches (newer version -> that older version),
 //    which makes every chain self contained
@@ -25,9 +29,15 @@ export const MAX_HISTORY_SUFFIX_LENGTH = 64;
 const INVALID_SUFFIX_CHARS = /[\\/:*?"<>|#^[\]]/;
 
 // Entry names are the base-36 UTC epoch in seconds, with a trailing "$" for
-// versions stored in full. Validating them avoids reading an unrelated zip
-// file that happens to be named like a history file
-const HISTORY_ENTRY_NAME = /^[0-9a-z]+\$?$/;
+// versions stored in full and an optional "~<n>" for the n-th extra version of
+// that second. Validating them avoids reading an unrelated zip file that
+// happens to be named like a history file
+const HISTORY_ENTRY_NAME = /^[0-9a-z]+(~[1-9][0-9]*)?\$?$/;
+
+// The same second sequence marker, only used to tell the extra versions of a
+// second apart. "~" is not part of the base-36 alphabet, so an entry name
+// without it always means the first version of that second
+const HISTORY_SEQUENCE_MARKER = "~";
 
 function containsControlChar(value: string): boolean {
     for (let i = 0; i < value.length; i++) {
@@ -43,6 +53,9 @@ export interface HistoryVersion {
     // Milliseconds since the epoch, as encoded in the entry name (second
     // precision)
     epoch: number;
+    // 0 for the first version stored for that second, n for the n-th extra
+    // version of the same second (higher is newer)
+    sequence: number;
     // Contents of the note at that version
     content: string;
 }
@@ -62,24 +75,68 @@ export interface PatchEngine {
     patch_apply(patches: any, text: string, ...rest: any[]): [string, boolean[]];
 }
 
+/**
+ * Split an entry name into its base-36 epoch part and its same-second sequence
+ */
+function parseHistoryEntryName(entryName: string): { epochPart: string; sequence: number } {
+    const markerIndex = entryName.indexOf(HISTORY_SEQUENCE_MARKER);
+    if (markerIndex < 0) {
+        return { epochPart: entryName, sequence: 0 };
+    }
+
+    return {
+        epochPart: entryName.substring(0, markerIndex),
+        sequence: parseInt(entryName.substring(markerIndex + HISTORY_SEQUENCE_MARKER.length), 10),
+    };
+}
+
 export function historyEntryEpoch(entryName: string): number {
-    return parseInt(entryName, 36) * 1000;
+    return parseInt(parseHistoryEntryName(entryName).epochPart, 36) * 1000;
+}
+
+/**
+ * @return 0 for the first version stored for that second, n for the n-th extra
+ *         version of that second
+ */
+export function historyEntrySequence(entryName: string): number {
+    return parseHistoryEntryName(entryName).sequence;
 }
 
 export function historyEntryIsDiff(entryName: string): boolean {
     return !entryName.endsWith("$");
 }
 
-export function buildHistoryEntryName(mtime: number, isDiff: boolean): string {
+export function buildHistoryEntryName(mtime: number, isDiff: boolean, sequence = 0): string {
     const utcepoch = Math.floor(mtime / 1000);
-    return utcepoch.toString(36) + (isDiff ? "" : "$");
+    const sequenceSuffix = (sequence > 0) ? HISTORY_SEQUENCE_MARKER + sequence : "";
+    return utcepoch.toString(36) + sequenceSuffix + (isDiff ? "" : "$");
 }
 
 /**
- * Sort in place, most recent first
+ * Name to store a new version of a second that may already hold versions: the
+ * plain name when it is free, otherwise the next free same-second sequence.
+ * Both the diff and the full form of a sequence count as taken, so a version is
+ * never split into two entries of the same second and sequence.
+ * The loop ends because every iteration builds a name not built before
+ */
+export function allocateHistoryEntryName(mtime: number, isDiff: boolean, usedEntryNames: Set<string>): string {
+    for (let sequence = 0; ; sequence++) {
+        const name = buildHistoryEntryName(mtime, isDiff, sequence);
+        const otherName = buildHistoryEntryName(mtime, !isDiff, sequence);
+        if (!usedEntryNames.has(name) && !usedEntryNames.has(otherName)) {
+            return name;
+        }
+    }
+}
+
+/**
+ * Sort in place, most recent first. Versions of the same second are ordered by
+ * their sequence, the extra ones being newer
  */
 function sortHistoryEntriesDescending(entryNames: string[]): void {
-    entryNames.sort((a, b) => historyEntryEpoch(b) - historyEntryEpoch(a));
+    entryNames.sort((a, b) =>
+        (historyEntryEpoch(b) - historyEntryEpoch(a)) ||
+        (historyEntrySequence(b) - historyEntrySequence(a)));
 }
 
 /**
@@ -187,43 +244,75 @@ export async function readHistoryVersions(zip: JSZip, patchEngine: PatchEngine):
         }
 
         content = versionContent;
-        versions.push({ epoch: historyEntryEpoch(entryName), content: versionContent });
+        versions.push({
+            epoch: historyEntryEpoch(entryName),
+            sequence: historyEntrySequence(entryName),
+            content: versionContent,
+        });
     }
 
     return { versions: versions, error: null };
 }
 
 export interface MergedVersions {
-    // Ascending by epoch
+    // Ascending by epoch, then by sequence within a second
     versions: HistoryVersion[];
-    // Number of versions dropped because another source already had that epoch.
-    // Note this is only about entry name collisions (second precision), not
-    // about different contents at the same epoch; the latter is tracked by the
-    // plugin while merging file sources
-    duplicateEpochs: number;
+    // Number of versions dropped because the same second already held a version
+    // with the same contents. Versions of the same second with different
+    // contents are all kept, numbered by their sequence
+    duplicateVersions: number;
 }
 
 /**
- * Merge version lists, earlier lists win. Versions are keyed by epoch since the
- * entry name can only represent second precision.
+ * Merge version lists, earlier lists win. A second can hold several versions,
+ * since the entry name only represents second precision: the versions of a
+ * second are collected oldest first, the ones of the first list keeping their
+ * order and the following lists appending the contents they do not have yet
  */
 export function mergeHistoryVersionLists(versionLists: HistoryVersion[][]): MergedVersions {
-    const byEpoch = new Map<number, HistoryVersion>();
-    let duplicateEpochs = 0;
+    // Epoch -> contents of that second, oldest first
+    const contentsByEpoch = new Map<number, string[]>();
+    let duplicateVersions = 0;
 
     for (const versionList of versionLists) {
+        const versionsByEpoch = new Map<number, HistoryVersion[]>();
         for (const version of versionList) {
-            if (byEpoch.has(version.epoch)) {
-                duplicateEpochs++;
-                continue;
+            const versions = versionsByEpoch.get(version.epoch);
+            if (versions == null) {
+                versionsByEpoch.set(version.epoch, [version]);
+            } else {
+                versions.push(version);
             }
-            byEpoch.set(version.epoch, version);
+        }
+
+        for (const [epoch, versions] of versionsByEpoch) {
+            versions.sort((a, b) => (a.sequence || 0) - (b.sequence || 0));
+
+            let contents = contentsByEpoch.get(epoch);
+            if (contents == null) {
+                contents = [];
+                contentsByEpoch.set(epoch, contents);
+            }
+
+            for (const version of versions) {
+                if (contents.includes(version.content)) {
+                    duplicateVersions++;
+                    continue;
+                }
+                contents.push(version.content);
+            }
         }
     }
 
-    const versions = Array.from(byEpoch.values());
-    versions.sort((a, b) => a.epoch - b.epoch);
-    return { versions: versions, duplicateEpochs: duplicateEpochs };
+    const versions: HistoryVersion[] = [];
+    for (const [epoch, contents] of contentsByEpoch) {
+        for (const [sequence, content] of contents.entries()) {
+            versions.push({ epoch: epoch, sequence: sequence, content: content });
+        }
+    }
+    versions.sort((a, b) => (a.epoch - b.epoch) || (a.sequence - b.sequence));
+
+    return { versions: versions, duplicateVersions: duplicateVersions };
 }
 
 export interface MergedHistoryZip {
@@ -244,16 +333,29 @@ export async function buildMergedHistoryZip(versions: HistoryVersion[], patchEng
     let newerContent: string | null = null;
 
     // The encoding below walks from the newest to the oldest version, so
-    // normalize the input instead of trusting the caller with the order and
-    // with unique epochs (the entry name only has second precision)
+    // normalize the input instead of trusting the caller with the order, with
+    // unique epochs (the entry name only has second precision) or with unique
+    // sequences: the versions of a second are renumbered in order, dropping the
+    // ones whose contents the second already holds
     const orderedVersions: HistoryVersion[] = [];
-    const seenEpochs = new Set<number>();
-    for (const version of [...versions].sort((a, b) => a.epoch - b.epoch)) {
-        if (seenEpochs.has(version.epoch)) {
+    const contentsByEpoch = new Map<number, string[]>();
+    for (const version of [...versions].sort((a, b) =>
+        (a.epoch - b.epoch) || ((a.sequence || 0) - (b.sequence || 0)))) {
+        let contents = contentsByEpoch.get(version.epoch);
+        if (contents == null) {
+            contents = [];
+            contentsByEpoch.set(version.epoch, contents);
+        }
+        if (contents.includes(version.content)) {
             continue;
         }
-        seenEpochs.add(version.epoch);
-        orderedVersions.push(version);
+
+        contents.push(version.content);
+        orderedVersions.push({
+            epoch: version.epoch,
+            sequence: contents.length - 1,
+            content: version.content,
+        });
     }
 
     for (let i = orderedVersions.length - 1; i >= 0; --i) {
@@ -267,15 +369,15 @@ export async function buildMergedHistoryZip(versions: HistoryVersion[], patchEng
         // (same as the plugin does when storing an edit)
         const date = new Date(version.epoch - new Date(version.epoch).getTimezoneOffset() * 60000);
         if (newerContent == null) {
-            zip.file(buildHistoryEntryName(version.epoch, false), version.content, { date: date, compression: "DEFLATE" });
+            zip.file(buildHistoryEntryName(version.epoch, false, version.sequence), version.content, { date: date, compression: "DEFLATE" });
             fullEntryCount++;
         } else {
             const patch = patchEngine.patch_toText(patchEngine.patch_make(newerContent, version.content));
             if (patch.length < version.content.length) {
-                zip.file(buildHistoryEntryName(version.epoch, true), patch, { date: date, compression: "DEFLATE" });
+                zip.file(buildHistoryEntryName(version.epoch, true, version.sequence), patch, { date: date, compression: "DEFLATE" });
             } else {
                 // Don't bother storing a diff larger than the full contents
-                zip.file(buildHistoryEntryName(version.epoch, false), version.content, { date: date, compression: "DEFLATE" });
+                zip.file(buildHistoryEntryName(version.epoch, false, version.sequence), version.content, { date: date, compression: "DEFLATE" });
                 fullEntryCount++;
             }
         }
